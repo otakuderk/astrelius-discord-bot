@@ -211,7 +211,7 @@ def extract_sheet(attachment: discord.Attachment, payload: bytes) -> SheetData:
                     if widget.field_name and widget.field_value is not None:
                         fields[widget.field_name] = str(widget.field_value).strip()
 
-             if fields:
+        if fields:
             log.info(
                 "D&D Beyond PDF form fields detected: %s",
                 list(fields.keys()),
@@ -304,6 +304,16 @@ def extract_sheet(attachment: discord.Attachment, payload: bytes) -> SheetData:
             text = "\n".join(pages)
 
         return parse_sheet_text(text)
+
+    elif content_type.startswith("image/") or filename.endswith(
+        (".png", ".jpg", ".jpeg", ".webp")
+    ):
+        image = Image.open(io.BytesIO(payload))
+        text = pytesseract.image_to_string(image)
+        return parse_sheet_text(text)
+
+    else:
+        raise ValueError("Upload a PDF, PNG, JPG, or WebP file.")
 
     elif content_type.startswith("image/") or filename.endswith(
         (".png", ".jpg", ".jpeg", ".webp")
