@@ -60,32 +60,139 @@ class SheetData:
     proficiencies: list[str]
 
 
+def ability_modifier(score: int) -> int:
+    return (score - 10) // 2
+
+
 def parse_sheet_text(text: str) -> SheetData:
-    normalized = re.sub(r"[ \t]+", " ", text)
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+
     stats: dict[str, int] = {}
-    for stat in STAT_NAMES:
-        match = re.search(rf"\b{stat}\b\s*(?:score)?\s*[:\-]?\s*(\d{{1,2}})\b", normalized, re.I)
-        if match and 1 <= int(match.group(1)) <= 30:
-            stats[stat] = int(match.group(1))
 
-    level_match = re.search(r"\b(?:total\s+level|character\s+level|level)\s*[:\-]?\s*(\d{1,2})\b", normalized, re.I)
-    level = int(level_match.group(1)) if level_match and 1 <= int(level_match.group(1)) <= 20 else None
+    stat_aliases = {
+        "Strength": ("STRENGTH", "STR"),
+        "Dexterity": ("DEXTERITY", "DEX"),
+        "Constitution": ("CONSTITUTION", "CON"),
+        "Intelligence": ("INTELLIGENCE", "INT"),
+        "Wisdom": ("WISDOM", "WIS"),
+        "Charisma": ("CHARISMA", "CHA"),
+    }
 
-    name = None
-    for pattern in (r"character\s+name\s*[:\-]?\s*([^\n|]{2,60})", r"^\s*([^\n]{2,60})"):
-        match = re.search(pattern, text, re.I | re.M)
+    for full_name, aliases in stat_aliases.items():
+        for i, line in enumerate(lines):
+            upper = line.upper()
+
+            if any(alias == upper or upper.startswith(alias + " ") for alias in aliases):
+                numbers = re.findall(r"\b([1-9]|[12][0-9]|30)\b", line)
+
+                if not numbers:
+                    for next_line in lines[i + 1:i + 4]:
+                        numbers = re.findall(r"\b([1-9]|[12][0-9]|30)\b", next_line)
+                        if numbers:
+                            break
+
+                if numbers:
+                    stats[full_name] = int(numbers[0])
+                    break
+
+    level = None
+
+    for line in lines:
+        match = re.search(
+            r"\b(?:TOTAL\s+LEVEL|CHARACTER\s+LEVEL|LEVEL)\s*[:\-]?\s*(\d{1,2})\b",
+            line,
+            re.I,
+        )
+
         if match:
-            candidate = match.group(1).strip()
-            if not re.search(r"D&D|Beyond|Character Sheet", candidate, re.I):
-                name = candidate
+            value = int(match.group(1))
+
+            if 1 <= value <= 20:
+                level = value
                 break
 
-    proficiencies: list[str] = []
-    block = re.search(r"proficiencies(?:\s*&\s*languages)?\s*[:\-]?\s*(.+?)(?:\n\s*\n|features|equipment|attacks)", text, re.I | re.S)
-    if block:
-        proficiencies = [p.strip(" •\t\r\n") for p in re.split(r"[,;\n•]", block.group(1)) if 1 < len(p.strip()) < 100][:50]
-    return SheetData(name=name, level=level, stats=stats, proficiencies=proficiencies)
+    name = None
 
+    for i, line in enumerate(lines):
+        if re.search(r"CHARACTER\s+NAME", line, re.I):
+            candidate = re.sub(
+                r"CHARACTER\s+NAME\s*[:\-]?",
+                "",
+                line,
+                flags=re.I,
+            ).strip()
+
+            if candidate:
+                name = candidate
+            elif i + 1 < len(lines):
+                name = lines[i + 1]
+
+            break
+
+    proficiencies: list[str] = []
+
+    start_index = None
+
+    for i, line in enumerate(lines):
+        if re.search(r"PROFICIENCIES(?:\s*&\s*LANGUAGES)?", line, re.I):
+            start_index = i + 1
+            break
+
+    if start_index is not None:
+        stop_headers = {
+            "FEATURES",
+            "FEATURES & TRAITS",
+            "EQUIPMENT",
+            "ATTACKS",
+            "ATTACKS & SPELLCASTING",
+            "SPELLS",
+            "PERSONALITY TRAITS",
+            "IDEALS",
+            "BONDS",
+            "FLAWS",
+            "CLASS FEATURES",
+        }
+
+        ignored_terms = (
+            "HIT POINT",
+            "TEMP HP",
+            "DEATH SAVE",
+            "ARMOR CLASS",
+            "INITIATIVE",
+            "SPEED",
+            "PROFICIENCY BONUS",
+            "PASSIVE WISDOM",
+            "CLASS",
+            "LEVEL",
+            "HIT DICE",
+            "DEFENSE",
+        )
+
+        for line in lines[start_index:]:
+            upper = line.upper().strip()
+
+            if upper in stop_headers:
+                break
+
+            if any(term in upper for term in ignored_terms):
+                continue
+
+            entries = [
+                item.strip(" •\t")
+                for item in re.split(r"[,;•]", line)
+                if item.strip(" •\t")
+            ]
+
+            for entry in entries:
+                if 1 < len(entry) < 100 and entry not in proficiencies:
+                    proficiencies.append(entry)
+
+    return SheetData(
+        name=name,
+        level=level,
+        stats=stats,
+        proficiencies=proficiencies,
+    )
 
 def extract_sheet(attachment: discord.Attachment, payload: bytes) -> SheetData:
     filename = attachment.filename.casefold()
