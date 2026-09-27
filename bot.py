@@ -176,16 +176,23 @@ async def get_character(interaction: discord.Interaction, member: discord.Member
     return row
 
 
-async def sync_rank_role(member: discord.Member, level: int) -> str | None:
+async def sync_rank_role(member: discord.Member) -> str | None:
     guild = member.guild
-    target_name = f"{rank_for_level(level)} Rank"
+    # Discord can assign only one account-level rank role. When a player has
+    # both Main and Alt characters, retain the highest rank they have earned.
+    highest_level = await db().fetchval(
+        "SELECT COALESCE(MAX(level), 1) FROM characters WHERE guild_id=$1 AND user_id=$2",
+        guild.id,
+        member.id,
+    )
+    target_name = f"{rank_for_level(int(highest_level))} Rank"
     target = discord.utils.get(guild.roles, name=target_name)
     removable = [role for role in member.roles if role.name in RANK_ROLE_NAMES and role.name != target_name]
     try:
         if removable:
-            await member.remove_roles(*removable, reason=f"D&D level updated to {level}")
+            await member.remove_roles(*removable, reason=f"D&D rank updated to level {highest_level}")
         if target and target not in member.roles:
-            await member.add_roles(target, reason=f"D&D level updated to {level}")
+            await member.add_roles(target, reason=f"D&D rank updated to level {highest_level}")
         return None if target else f" The `{target_name}` role does not exist yet."
     except discord.Forbidden:
         return " I could not update the rank role; move my bot role above all rank roles."
@@ -213,12 +220,12 @@ async def mutate_number(interaction: discord.Interaction, member: discord.Member
         new_level = level_for_mp(new_value)
         await db().execute("UPDATE characters SET mp=$1, level=$2, rank=$3, updated_at=now() WHERE guild_id=$4 AND user_id=$5 AND slot=$6",
                            new_value, new_level, rank_for_level(new_level), interaction.guild_id, member.id, slot)
-        role_note = await sync_rank_role(member, new_level) or ""
+        role_note = await sync_rank_role(member) or ""
     elif field == "level":
         new_mp = LEVEL_THRESHOLDS[new_value]
         await db().execute("UPDATE characters SET level=$1, mp=$2, rank=$3, updated_at=now() WHERE guild_id=$4 AND user_id=$5 AND slot=$6",
                            new_value, new_mp, rank_for_level(new_value), interaction.guild_id, member.id, slot)
-        role_note = await sync_rank_role(member, new_value) or ""
+        role_note = await sync_rank_role(member) or ""
     else:
         await db().execute(f"UPDATE characters SET {field}=$1, updated_at=now() WHERE guild_id=$2 AND user_id=$3 AND slot=$4",
                            new_value, interaction.guild_id, member.id, slot)
@@ -250,7 +257,11 @@ async def character_delete(interaction: discord.Interaction, slot: app_commands.
         await interaction.response.send_message("Nothing was deleted. Type `DELETE` exactly to confirm.", ephemeral=True)
         return
     result = await db().execute("DELETE FROM characters WHERE guild_id=$1 AND user_id=$2 AND slot=$3", interaction.guild_id, interaction.user.id, slot.value)
-    await interaction.response.send_message("Character deleted." if result.endswith("1") else "That character did not exist.", ephemeral=True)
+    if result.endswith("1"):
+        role_note = await sync_rank_role(interaction.user) or ""
+        await interaction.response.send_message(f"Character deleted.{role_note}", ephemeral=True)
+    else:
+        await interaction.response.send_message("That character did not exist.", ephemeral=True)
 
 
 @bot.tree.command(name="inventory", description="View your Main or Alt character inventory")
