@@ -211,7 +211,7 @@ def extract_sheet(attachment: discord.Attachment, payload: bytes) -> SheetData:
                     if widget.field_name and widget.field_value is not None:
                         fields[widget.field_name] = str(widget.field_value).strip()
 
-          if fields:
+             if fields:
             log.info(
                 "D&D Beyond PDF form fields detected: %s",
                 list(fields.keys()),
