@@ -126,15 +126,8 @@ class DndBot(commands.Bot):
         async with self.pool.acquire() as connection:
             await connection.execute(SCHEMA)
         guild_id = os.getenv("DISCORD_GUILD_ID")
-        if guild_id:
-            guild = discord.Object(id=int(guild_id))
-            self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
-            log.info("Synced commands to test guild %s", guild_id)
-        else:
-            await self.tree.sync()
-            log.info("Synced global commands")
-
+       await self.tree.sync()
+log.info("Synced global commands")
     async def close(self) -> None:
         if self.pool:
             await self.pool.close()
