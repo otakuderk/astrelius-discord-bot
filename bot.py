@@ -212,6 +212,7 @@ def extract_sheet(attachment: discord.Attachment, payload: bytes) -> SheetData:
                         fields[widget.field_name] = str(widget.field_value).strip()
 
         if fields:
+          log.info("D&D Beyond PDF form fields detected: %s", list(fields.keys()))
             stats: dict[str, int] = {}
 
             field_to_stat = {
