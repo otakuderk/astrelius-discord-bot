@@ -372,16 +372,80 @@ async def inventory(interaction: discord.Interaction, slot: app_commands.Choice[
     materials = dict(row["materials"])
     stats = dict(row["stats"])
     profs = list(row["proficiencies"])
-    embed = discord.Embed(title=f"{interaction.user.display_name} — {row['character_name']} ({slot.value})", color=discord.Color.gold())
-    embed.add_field(name="Level / Rank", value=f"{row['level']} / {row['rank']}")
-    embed.add_field(name="MP", value=f"{row['mp']} total\n{mp_until_next(row['level'], row['mp'])} until next level")
-    embed.add_field(name="Gold", value=str(row["gold"]))
-    embed.add_field(name="Downtime", value=f"{row['downtime_hours']} / 40 hours")
-    embed.add_field(name="Stats", value="\n".join(f"{k}: {v}" for k, v in stats.items()) or "Not imported", inline=False)
-    embed.add_field(name="Proficiencies", value=", ".join(profs)[:1024] or "Not imported", inline=False)
-    embed.add_field(name="Materials", value="\n".join(f"{k}: {v}" for k, v in sorted(materials.items()))[:1024] or "None", inline=False)
-    await interaction.followup.send(embed=embed, ephemeral=True)
 
+    embed = discord.Embed(
+        title=f"{interaction.user.display_name} ({slot.value})",
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="Level / Rank",
+        value=f"{row['level']} / {row['rank']}",
+    )
+
+    embed.add_field(
+        name="MP",
+        value=f"{row['mp']} total\n{mp_until_next(row['level'], row['mp'])} until next level",
+    )
+
+    embed.add_field(
+        name="Gold",
+        value=str(row["gold"]),
+    )
+
+    embed.add_field(
+        name="Downtime Hours",
+        value=f"{row['downtime_hours']} / 40",
+    )
+
+    stat_abbreviations = {
+        "Strength": "STR",
+        "Dexterity": "DEX",
+        "Constitution": "CON",
+        "Intelligence": "INT",
+        "Wisdom": "WIS",
+        "Charisma": "CHA",
+    }
+
+    stat_lines = []
+
+    for stat_name in (
+        "Strength",
+        "Dexterity",
+        "Constitution",
+        "Intelligence",
+        "Wisdom",
+        "Charisma",
+    ):
+        if stat_name in stats:
+            score = int(stats[stat_name])
+            modifier = ability_modifier(score)
+            stat_lines.append(
+                f"{stat_abbreviations[stat_name]} {score} ({modifier:+d})"
+            )
+
+    embed.add_field(
+        name="Stats",
+        value="\n".join(stat_lines) or "Not imported",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Proficiencies",
+        value="\n".join(f"• {prof}" for prof in profs)[:1024] or "Not imported",
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Materials",
+        value="\n".join(
+            f"{material}: {quantity}"
+            for material, quantity in sorted(materials.items())
+        )[:1024] or "None",
+        inline=False,
+    )
+
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 @downtime.command(name="spend", description="Spend downtime in 8-hour increments")
 @app_commands.choices(slot=SLOTS)
