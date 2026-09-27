@@ -1,0 +1,6 @@
+discord.py==2.6.4
+asyncpg==0.30.0
+PyMuPDF==1.26.4
+Pillow==11.3.0
+pytesseract==0.3.13
+
