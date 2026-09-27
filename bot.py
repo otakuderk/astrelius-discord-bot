@@ -25,6 +25,10 @@ logging.basicConfig(
 log = logging.getLogger("dnd-bot")
 
 
+# =========================================================
+# CONSTANTS
+# =========================================================
+
 Slot = Literal["Main", "Alt"]
 
 SLOTS = [
@@ -98,13 +102,17 @@ STAT_NAMES = (
 )
 
 
+# =========================================================
+# PROGRESSION
+# =========================================================
+
 def level_for_mp(mp: int) -> int:
-    safe_mp = max(0, mp)
+    mp = max(0, mp)
 
     return max(
         level
         for level, threshold in LEVEL_THRESHOLDS.items()
-        if threshold <= safe_mp
+        if threshold <= mp
     )
 
 
@@ -128,6 +136,10 @@ def mp_until_next(
         LEVEL_THRESHOLDS[level + 1] - max(0, mp),
     )
 
+
+# =========================================================
+# PERMISSIONS
+# =========================================================
 
 def staff_only(
     interaction: discord.Interaction,
@@ -155,6 +167,10 @@ async def staff_check(
     )
 
 
+# =========================================================
+# DISCORD RANK
+# =========================================================
+
 def discord_rank_for_member(
     member: discord.Member,
 ) -> str | None:
@@ -163,15 +179,16 @@ def discord_rank_for_member(
         for role in member.roles
     }
 
-    # Start at S and work downward.
-    # If someone accidentally has multiple rank roles,
-    # the highest one is displayed.
     for rank in reversed(RANK_ORDER):
         if f"{rank} Rank" in role_names:
             return rank
 
     return None
 
+
+# =========================================================
+# SHEET DATA
+# =========================================================
 
 @dataclass
 class SheetData:
@@ -188,14 +205,45 @@ def ability_modifier(
     return (score - 10) // 2
 
 
+def normalize_field_name(
+    value: str,
+) -> str:
+    return re.sub(
+        r"[^a-z0-9]",
+        "",
+        value.casefold(),
+    )
+
+
+def find_form_field(
+    fields: dict[str, str],
+    *possible_names: str,
+) -> str:
+    normalized_fields = {
+        normalize_field_name(key): value
+        for key, value in fields.items()
+    }
+
+    for possible_name in possible_names:
+        match = normalized_fields.get(
+            normalize_field_name(
+                possible_name
+            )
+        )
+
+        if match:
+            return match.strip()
+
+    return ""
+
+
+# =========================================================
+# FALLBACK SHEET PARSER
+# =========================================================
+
 def parse_sheet_text(
     text: str,
 ) -> SheetData:
-    """
-    Fallback parser for screenshots or PDFs
-    without readable D&D Beyond form fields.
-    """
-
     lines = [
         line.strip()
         for line in text.splitlines()
@@ -228,7 +276,7 @@ def parse_sheet_text(
                 )
 
                 if not numbers:
-                    for next_line in lines[i + 1 : i + 4]:
+                    for next_line in lines[i + 1:i + 4]:
                         numbers = re.findall(
                             r"\b([1-9]|[12][0-9]|30)\b",
                             next_line,
@@ -241,7 +289,6 @@ def parse_sheet_text(
                     stats[full_name] = int(
                         numbers[0]
                     )
-
                     break
 
     name = None
@@ -270,6 +317,7 @@ def parse_sheet_text(
     class_name = None
     subclass_name = None
 
+    # Try common class + level layouts.
     for line in lines:
         match = re.search(
             r"(?:CLASS\s*&\s*LEVEL|CLASS\s+LEVEL)"
@@ -281,20 +329,33 @@ def parse_sheet_text(
         )
 
         if match:
-            class_name = match.group(1).strip()
+            class_name = (
+                match.group(1).strip()
+            )
             break
 
+    # Search for "... Wizard Subclass ... | Occultist"
     for line in lines:
-        match = re.search(
-            r"\b[A-Za-z][A-Za-z '\-]*\s+Subclass\b"
+        subclass_match = re.search(
+            r"\b([A-Za-z][A-Za-z '\-]*)"
+            r"\s+Subclass\b"
             r".*?\|\s*([^*|\n]+)",
             line,
             re.I,
         )
 
-        if match:
+        if subclass_match:
+            if not class_name:
+                class_name = (
+                    subclass_match
+                    .group(1)
+                    .strip()
+                )
+
             subclass_name = (
-                match.group(1).strip()
+                subclass_match
+                .group(2)
+                .strip()
             )
 
             break
@@ -382,6 +443,10 @@ def parse_sheet_text(
     )
 
 
+# =========================================================
+# D&D BEYOND PDF PARSER
+# =========================================================
+
 def extract_sheet(
     attachment: discord.Attachment,
     payload: bytes,
@@ -441,8 +506,9 @@ def extract_sheet(
                 field_name,
                 stat_name,
             ) in field_to_stat.items():
-                value = fields.get(
-                    field_name
+                value = find_form_field(
+                    fields,
+                    field_name,
                 )
 
                 if value:
@@ -457,16 +523,30 @@ def extract_sheet(
                     except ValueError:
                         pass
 
-            name = fields.get(
-                "CharacterName"
-            )
+            name = find_form_field(
+                fields,
+                "CharacterName",
+                "Character Name",
+            ) or None
 
-            # Read class, but DO NOT import level.
+            # -------------------------------------------------
+            # CLASS
+            #
+            # D&D Beyond PDFs can vary slightly in field naming.
+            # We normalize the field names before looking them up.
+            #
+            # IMPORTANT: We strip the sheet level off and never
+            # use it for server progression.
+            # -------------------------------------------------
+
             class_name = None
 
-            class_level = fields.get(
+            class_level = find_form_field(
+                fields,
                 "CLASS LEVEL",
-                "",
+                "Class Level",
+                "ClassLevel",
+                "Class & Level",
             )
 
             if class_level:
@@ -476,40 +556,56 @@ def extract_sheet(
                     class_level,
                 ).strip() or None
 
-            # Look through D&D Beyond feature fields
-            # for entries such as:
-            # "Wizard Subclass ... | Occultist"
+            # -------------------------------------------------
+            # SUBCLASS
+            # -------------------------------------------------
+
             subclass_name = None
 
             features_text = " ".join(
                 value
                 for key, value in fields.items()
-                if key.startswith(
-                    "FeaturesTraits"
-                )
+                if "feature" in key.casefold()
+                or "trait" in key.casefold()
             )
 
             subclass_match = re.search(
-                r"\b[A-Za-z][A-Za-z '\-]*"
+                r"\b([A-Za-z][A-Za-z '\-]*)"
                 r"\s+Subclass\b"
-                r"[^|]{0,120}\|"
+                r"[^|]{0,150}\|"
                 r"\s*([^*|\n]+)",
                 features_text,
                 re.I,
             )
 
             if subclass_match:
+                # If class field failed, recover the class
+                # from "Wizard Subclass ..."
+                if not class_name:
+                    class_name = (
+                        subclass_match
+                        .group(1)
+                        .strip()
+                    )
+
                 subclass_name = (
                     subclass_match
-                    .group(1)
+                    .group(2)
                     .strip()
                 )
 
+            # -------------------------------------------------
+            # PROFICIENCIES
+            # -------------------------------------------------
+
             proficiencies: list[str] = []
 
-            training = fields.get(
+            training = find_form_field(
+                fields,
                 "ProficienciesLang",
-                "",
+                "Proficiencies Lang",
+                "Proficiencies & Languages",
+                "Proficiencies & Training",
             )
 
             if training:
@@ -537,13 +633,16 @@ def extract_sheet(
                     ]
 
                     for entry in entries:
-                        if (
-                            entry
-                            not in proficiencies
-                        ):
+                        if entry not in proficiencies:
                             proficiencies.append(
                                 entry
                             )
+
+            log.info(
+                "Parsed sheet class=%r subclass=%r",
+                class_name,
+                subclass_name,
+            )
 
             return SheetData(
                 name=name,
@@ -553,6 +652,7 @@ def extract_sheet(
                 proficiencies=proficiencies,
             )
 
+        # PDF without useful form fields
         text = "\n".join(
             page.get_text("text")
             for page in document
@@ -572,15 +672,12 @@ def extract_sheet(
 
                 image = Image.open(
                     io.BytesIO(
-                        pix.tobytes(
-                            "png"
-                        )
+                        pix.tobytes("png")
                     )
                 )
 
                 pages.append(
-                    pytesseract
-                    .image_to_string(
+                    pytesseract.image_to_string(
                         image
                     )
                 )
@@ -594,9 +691,7 @@ def extract_sheet(
         )
 
     if (
-        content_type.startswith(
-            "image/"
-        )
+        content_type.startswith("image/")
         or filename.endswith(
             (
                 ".png",
@@ -611,8 +706,7 @@ def extract_sheet(
         )
 
         text = (
-            pytesseract
-            .image_to_string(
+            pytesseract.image_to_string(
                 image
             )
         )
@@ -625,6 +719,10 @@ def extract_sheet(
         "Upload a PDF, PNG, JPG, or WebP file."
     )
 
+
+# =========================================================
+# BOT
+# =========================================================
 
 class DndBot(commands.Bot):
     def __init__(self) -> None:
@@ -657,15 +755,12 @@ class DndBot(commands.Bot):
                 "json",
                 "jsonb",
             ):
-                await (
-                    connection
-                    .set_type_codec(
-                        type_name,
-                        schema="pg_catalog",
-                        encoder=json.dumps,
-                        decoder=json.loads,
-                        format="text",
-                    )
+                await connection.set_type_codec(
+                    type_name,
+                    schema="pg_catalog",
+                    encoder=json.dumps,
+                    decoder=json.loads,
+                    format="text",
                 )
 
         self.pool = (
@@ -678,9 +773,7 @@ class DndBot(commands.Bot):
             )
         )
 
-        async with (
-            self.pool.acquire()
-        ) as connection:
+        async with self.pool.acquire() as connection:
             await connection.execute(
                 SCHEMA
             )
@@ -700,35 +793,50 @@ class DndBot(commands.Bot):
         await super().close()
 
 
+# =========================================================
+# DATABASE
+# =========================================================
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS characters (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
+
     slot TEXT NOT NULL CHECK (
         slot IN ('Main', 'Alt')
     ),
+
     character_name TEXT NOT NULL,
+
     class_name TEXT,
     subclass_name TEXT,
+
     mp INTEGER NOT NULL DEFAULT 0 CHECK (
         mp >= 0
     ),
+
     level SMALLINT NOT NULL DEFAULT 1 CHECK (
         level BETWEEN 1 AND 20
     ),
+
     rank CHAR(1) NOT NULL DEFAULT 'F' CHECK (
         rank IN ('F','E','D','C','B','A','S')
     ),
+
     gold INTEGER NOT NULL DEFAULT 0 CHECK (
         gold >= 0
     ),
+
     materials JSONB NOT NULL DEFAULT '{}'::jsonb,
     proficiencies JSONB NOT NULL DEFAULT '[]'::jsonb,
     stats JSONB NOT NULL DEFAULT '{}'::jsonb,
+
     downtime_hours SMALLINT NOT NULL DEFAULT 0 CHECK (
         downtime_hours BETWEEN 0 AND 40
     ),
+
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
     PRIMARY KEY (
         guild_id,
         user_id,
@@ -787,6 +895,10 @@ async def get_character(
     return row
 
 
+# =========================================================
+# RANK ROLE SYNC
+# =========================================================
+
 async def sync_rank_role(
     member: discord.Member,
 ) -> str | None:
@@ -818,10 +930,8 @@ async def sync_rank_role(
         role
         for role in member.roles
         if (
-            role.name
-            in RANK_ROLE_NAMES
-            and role.name
-            != target_name
+            role.name in RANK_ROLE_NAMES
+            and role.name != target_name
         )
     ]
 
@@ -837,8 +947,7 @@ async def sync_rank_role(
 
         if (
             target
-            and target
-            not in member.roles
+            and target not in member.roles
         ):
             await member.add_roles(
                 target,
@@ -879,6 +988,10 @@ async def finish_staff_change_silently(
         pass
 
 
+# =========================================================
+# NUMERIC MUTATIONS
+# =========================================================
+
 async def mutate_number(
     interaction: discord.Interaction,
     member: discord.Member,
@@ -917,15 +1030,14 @@ async def mutate_number(
             current - amount
         )
 
-    # MP can NEVER go below zero.
-    # Removing more than the character has
-    # simply results in zero.
+    # MP has a hard floor of zero.
     if field == "mp":
         new_value = max(
             0,
             new_value,
         )
 
+    # Gold still cannot become negative.
     elif field == "gold":
         if new_value < 0:
             await interaction.followup.send(
@@ -935,8 +1047,7 @@ async def mutate_number(
 
             return
 
-    # Downtime always stays between
-    # zero and forty.
+    # Downtime remains between 0 and 40.
     elif field == "downtime_hours":
         if mode == "add":
             new_value = min(
@@ -951,10 +1062,10 @@ async def mutate_number(
             )
 
         else:
-            new_value = min(
-                40,
-                max(
-                    0,
+            new_value = max(
+                0,
+                min(
+                    40,
                     new_value,
                 ),
             )
@@ -964,10 +1075,7 @@ async def mutate_number(
             1 <= new_value <= 20
         ):
             await interaction.followup.send(
-                (
-                    "Level must stay "
-                    "between 1 and 20."
-                ),
+                "Level must stay between 1 and 20.",
                 ephemeral=True,
             )
 
@@ -1071,8 +1179,6 @@ async def mutate_number(
             slot,
         )
 
-    # Only show a response when something
-    # actually went wrong with the role.
     if role_note:
         await interaction.followup.send(
             role_note,
@@ -1080,70 +1186,58 @@ async def mutate_number(
         )
 
     else:
-        await (
-            finish_staff_change_silently(
-                interaction
-            )
+        await finish_staff_change_silently(
+            interaction
         )
 
 
+# =========================================================
+# COMMAND GROUPS
+# =========================================================
+
 character = app_commands.Group(
     name="character",
-    description=(
-        "Manage your two character slots"
-    ),
+    description="Manage your two character slots",
 )
 
 sheet = app_commands.Group(
     name="sheet",
-    description=(
-        "Import a D&D Beyond character sheet"
-    ),
+    description="Import a D&D Beyond character sheet",
 )
 
 downtime = app_commands.Group(
     name="downtime",
-    description=(
-        "Manage downtime hours"
-    ),
+    description="Manage downtime hours",
 )
 
 mp_group = app_commands.Group(
     name="mp",
-    description=(
-        "DM/GM MP management"
-    ),
+    description="DM/GM MP management",
 )
 
 level_group = app_commands.Group(
     name="level",
-    description=(
-        "DM/GM level management"
-    ),
+    description="DM/GM level management",
 )
 
 gold_group = app_commands.Group(
     name="gold",
-    description=(
-        "DM/GM gold management"
-    ),
+    description="DM/GM gold management",
 )
 
-materials_group = (
-    app_commands.Group(
-        name="materials",
-        description=(
-            "DM/GM material management"
-        ),
-    )
+materials_group = app_commands.Group(
+    name="materials",
+    description="DM/GM material management",
 )
 
+
+# =========================================================
+# CHARACTER COMMANDS
+# =========================================================
 
 @character.command(
     name="create",
-    description=(
-        "Create or rename your Main or Alt character"
-    ),
+    description="Create or rename your Main or Alt character",
 )
 @app_commands.choices(
     slot=SLOTS
@@ -1182,24 +1276,18 @@ async def character_create(
         name.strip(),
     )
 
-    await (
-        interaction
-        .response
-        .send_message(
-            (
-                f"Your {slot.value} character "
-                f"is now **{name.strip()}**."
-            ),
-            ephemeral=True,
-        )
+    await interaction.response.send_message(
+        (
+            f"Your {slot.value} character "
+            f"is now **{name.strip()}**."
+        ),
+        ephemeral=True,
     )
 
 
 @character.command(
     name="delete",
-    description=(
-        "Delete one of your character records"
-    ),
+    description="Delete one of your character records",
 )
 @app_commands.choices(
     slot=SLOTS
@@ -1210,17 +1298,12 @@ async def character_delete(
     confirmation: str,
 ):
     if confirmation != "DELETE":
-        await (
-            interaction
-            .response
-            .send_message(
-                (
-                    "Nothing was deleted. "
-                    "Type `DELETE` exactly "
-                    "to confirm."
-                ),
-                ephemeral=True,
-            )
+        await interaction.response.send_message(
+            (
+                "Nothing was deleted. "
+                "Type `DELETE` exactly to confirm."
+            ),
+            ephemeral=True,
         )
 
         return
@@ -1238,34 +1321,25 @@ async def character_delete(
     )
 
     if result.endswith("1"):
-        await (
-            interaction
-            .response
-            .send_message(
-                "Character deleted.",
-                ephemeral=True,
-            )
+        await interaction.response.send_message(
+            "Character deleted.",
+            ephemeral=True,
         )
 
     else:
-        await (
-            interaction
-            .response
-            .send_message(
-                (
-                    "That character "
-                    "did not exist."
-                ),
-                ephemeral=True,
-            )
+        await interaction.response.send_message(
+            "That character did not exist.",
+            ephemeral=True,
         )
 
 
+# =========================================================
+# INVENTORY
+# =========================================================
+
 @bot.tree.command(
     name="inventory",
-    description=(
-        "View your Main or Alt character inventory"
-    ),
+    description="View your Main or Alt character inventory",
 )
 @app_commands.choices(
     slot=SLOTS
@@ -1299,8 +1373,7 @@ async def inventory(
         row["proficiencies"]
     )
 
-    # MP is the server-side source of truth
-    # for the exact level.
+    # MP controls exact server level.
     server_mp = max(
         0,
         int(row["mp"]),
@@ -1318,12 +1391,10 @@ async def inventory(
         )
     )
 
-    # Repair any old DB mismatch automatically.
+    # Fix older mismatched DB records.
     if (
-        int(row["level"])
-        != server_level
-        or str(row["rank"])
-        != calculated_rank
+        int(row["level"]) != server_level
+        or str(row["rank"]) != calculated_rank
     ):
         await db().execute(
             """
@@ -1344,8 +1415,7 @@ async def inventory(
             slot.value,
         )
 
-    # Discord role is the displayed
-    # source of truth for Rank.
+    # Rank displayed from actual Discord role.
     discord_rank = None
 
     if isinstance(
@@ -1371,33 +1441,32 @@ async def inventory(
         "subclass_name"
     ]
 
-    class_line = None
+    # Class and subclass are displayed
+    # on separate lines, Class first.
+    class_lines: list[str] = []
 
-    if (
-        class_name
-        and subclass_name
-    ):
-        class_line = (
-            f"{class_name} • "
-            f"{subclass_name}"
+    if class_name:
+        class_lines.append(
+            f"Class: {class_name}"
         )
 
-    elif class_name:
-        class_line = str(
-            class_name
+    if subclass_name:
+        class_lines.append(
+            f"Subclass: {subclass_name}"
         )
 
-    elif subclass_name:
-        class_line = str(
-            subclass_name
-        )
+    class_display = (
+        "\n".join(class_lines)
+        if class_lines
+        else None
+    )
 
     embed = discord.Embed(
         title=(
             f"{interaction.user.display_name} "
             f"({slot.value})"
         ),
-        description=class_line,
+        description=class_display,
         color=discord.Color.gold(),
     )
 
@@ -1515,74 +1584,16 @@ async def inventory(
     )
 
 
-@downtime.command(
-    name="spend",
-    description=(
-        "Spend downtime hours"
-    ),
-)
-@app_commands.choices(
-    slot=SLOTS,
-    hours=DOWNTIME_CHOICES,
-)
-async def downtime_spend(
-    interaction: discord.Interaction,
-    slot: app_commands.Choice[str],
-    hours: app_commands.Choice[int],
-):
-    await interaction.response.defer(
-        ephemeral=True
-    )
-
-    result = await db().execute(
-        """
-        UPDATE characters
-        SET downtime_hours=downtime_hours-$1,
-            updated_at=now()
-        WHERE guild_id=$2
-        AND user_id=$3
-        AND slot=$4
-        AND downtime_hours >= $1
-        """,
-        hours.value,
-        interaction.guild_id,
-        interaction.user.id,
-        slot.value,
-    )
-
-    if result.endswith("1"):
-        await (
-            interaction
-            .followup
-            .send(
-                (
-                    f"Spent {hours.value} "
-                    "downtime hours."
-                ),
-                ephemeral=True,
-            )
-        )
-
-    else:
-        await (
-            interaction
-            .followup
-            .send(
-                (
-                    "Not enough downtime hours, "
-                    "or that character "
-                    "does not exist."
-                ),
-                ephemeral=True,
-            )
-        )
-
+# =========================================================
+# DOWNTIME
+#
+# No /downtime spend command yet.
+# Player hobbies will be added later.
+# =========================================================
 
 @downtime.command(
     name="add",
-    description=(
-        "Add downtime hours"
-    ),
+    description="Add downtime hours",
 )
 @app_commands.choices(
     slot=SLOTS,
@@ -1609,9 +1620,7 @@ async def downtime_add(
 
 @downtime.command(
     name="remove",
-    description=(
-        "Remove downtime hours"
-    ),
+    description="Remove downtime hours",
 )
 @app_commands.choices(
     slot=SLOTS,
@@ -1638,9 +1647,7 @@ async def downtime_remove(
 
 @downtime.command(
     name="set",
-    description=(
-        "Set downtime hours"
-    ),
+    description="Set downtime hours",
 )
 @app_commands.choices(
     slot=SLOTS,
@@ -1665,6 +1672,10 @@ async def downtime_set(
     )
 
 
+# =========================================================
+# SHEET IMPORT
+# =========================================================
+
 @sheet.command(
     name="import",
     description=(
@@ -1686,16 +1697,9 @@ async def sheet_import(
     )
 
     if file.size > 12_000_000:
-        await (
-            interaction
-            .followup
-            .send(
-                (
-                    "Please upload a file "
-                    "smaller than 12 MB."
-                ),
-                ephemeral=True,
-            )
+        await interaction.followup.send(
+            "Please upload a file smaller than 12 MB.",
+            ephemeral=True,
         )
 
         return
@@ -1721,16 +1725,9 @@ async def sheet_import(
             exc,
         )
 
-        await (
-            interaction
-            .followup
-            .send(
-                (
-                    "I couldn't read that sheet: "
-                    f"{exc}"
-                ),
-                ephemeral=True,
-            )
+        await interaction.followup.send(
+            f"I couldn't read that sheet: {exc}",
+            ephemeral=True,
         )
 
         return
@@ -1742,26 +1739,26 @@ async def sheet_import(
         and not parsed.class_name
         and not parsed.subclass_name
     ):
-        await (
-            interaction
-            .followup
-            .send(
-                (
-                    "I could not recognize "
-                    "character details. "
-                    "Try the exported "
-                    "D&D Beyond PDF."
-                ),
-                ephemeral=True,
-            )
+        await interaction.followup.send(
+            (
+                "I could not recognize character details. "
+                "Try the exported D&D Beyond PDF."
+            ),
+            ephemeral=True,
         )
 
         return
 
-    # IMPORTANT:
-    # D&D Beyond does NOT update:
-    # MP, Level, Rank, Gold,
-    # Materials or Downtime.
+    # D&D Beyond never changes:
+    #
+    # MP
+    # Level
+    # Rank
+    # Gold
+    # Materials
+    # Downtime
+    #
+    # It only updates sheet-derived details.
     await db().execute(
         """
         UPDATE characters
@@ -1800,20 +1797,22 @@ async def sheet_import(
         slot.value,
     )
 
-    await (
-        interaction
-        .followup
-        .send(
-            (
-                "Sheet imported. "
-                "Stats, proficiencies, "
-                "class, and subclass updated. "
-                "Server progression was preserved."
-            ),
-            ephemeral=True,
-        )
+    await interaction.followup.send(
+        (
+            "Sheet imported. "
+            "Class, subclass, stats, and proficiencies updated. "
+            "Server progression was preserved."
+        ),
+        ephemeral=True,
     )
 
+
+# =========================================================
+# GENERIC STAFF NUMERIC COMMANDS
+#
+# Only MP and Gold use these.
+# Downtime has its own dropdown commands.
+# =========================================================
 
 def install_numeric_commands(
     group: app_commands.Group,
@@ -1921,8 +1920,7 @@ def install_numeric_commands(
             group.command(
                 name="set",
                 description=(
-                    f"Set "
-                    f"{field.replace('_', ' ')}"
+                    f"Set {field.replace('_', ' ')}"
                 ),
             )(set_value)
         )
@@ -1942,6 +1940,10 @@ install_numeric_commands(
     "gold",
 )
 
+
+# =========================================================
+# LEVEL
+# =========================================================
 
 @level_group.command(
     name="set",
@@ -1976,11 +1978,13 @@ async def level_set(
     )
 
 
+# =========================================================
+# MATERIALS
+# =========================================================
+
 @materials_group.command(
     name="add",
-    description=(
-        "Add a material to a character"
-    ),
+    description="Add a material to a character",
 )
 @app_commands.choices(
     slot=SLOTS
@@ -2047,19 +2051,14 @@ async def materials_add(
         slot.value,
     )
 
-    await (
-        finish_staff_change_silently(
-            interaction
-        )
+    await finish_staff_change_silently(
+        interaction
     )
 
 
 @materials_group.command(
     name="remove",
-    description=(
-        "Remove a material "
-        "from a character"
-    ),
+    description="Remove a material from a character",
 )
 @app_commands.choices(
     slot=SLOTS
@@ -2109,16 +2108,12 @@ async def materials_remove(
     )
 
     if current < quantity:
-        await (
-            interaction
-            .followup
-            .send(
-                (
-                    f"Only {current} × "
-                    f"{key} is available."
-                ),
-                ephemeral=True,
-            )
+        await interaction.followup.send(
+            (
+                f"Only {current} × "
+                f"{key} is available."
+            ),
+            ephemeral=True,
         )
 
         return
@@ -2151,12 +2146,14 @@ async def materials_remove(
         slot.value,
     )
 
-    await (
-        finish_staff_change_silently(
-            interaction
-        )
+    await finish_staff_change_silently(
+        interaction
     )
 
+
+# =========================================================
+# REGISTER GROUPS
+# =========================================================
 
 for group in (
     character,
@@ -2171,6 +2168,10 @@ for group in (
         group
     )
 
+
+# =========================================================
+# ERRORS
+# =========================================================
 
 @bot.tree.error
 async def on_app_command_error(
@@ -2191,25 +2192,21 @@ async def on_app_command_error(
         .response
         .is_done()
     ):
-        await (
-            interaction
-            .followup
-            .send(
-                message,
-                ephemeral=True,
-            )
+        await interaction.followup.send(
+            message,
+            ephemeral=True,
         )
 
     else:
-        await (
-            interaction
-            .response
-            .send_message(
-                message,
-                ephemeral=True,
-            )
+        await interaction.response.send_message(
+            message,
+            ephemeral=True,
         )
 
+
+# =========================================================
+# READY
+# =========================================================
 
 @bot.event
 async def on_ready():
@@ -2223,6 +2220,10 @@ async def on_ready():
         ),
     )
 
+
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
     token = os.getenv(
