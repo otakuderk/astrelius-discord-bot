@@ -126,21 +126,20 @@ class DndBot(commands.Bot):
         async with self.pool.acquire() as connection:
             await connection.execute(SCHEMA)
         guild_id = os.getenv("DISCORD_GUILD_ID")
-guild_id = os.getenv("DISCORD_GUILD_ID")
+        guild_id = os.getenv("DISCORD_GUILD_ID")
 
-if guild_id:
-    guild = discord.Object(id=int(guild_id))
-    self.tree.clear_commands(guild=guild)
-    await self.tree.sync(guild=guild)
+        if guild_id:
+            guild = discord.Object(id=int(guild_id))
+            self.tree.clear_commands(guild=guild)
+            await self.tree.sync(guild=guild)
 
-await self.tree.sync()
-log.info("Cleared old guild commands and synced global commands")
+        await self.tree.sync()
+        log.info("Cleared old guild commands and synced global commands")
+
     async def close(self) -> None:
         if self.pool:
             await self.pool.close()
         await super().close()
-
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS characters (
     guild_id BIGINT NOT NULL,
