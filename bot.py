@@ -197,21 +197,119 @@ def parse_sheet_text(text: str) -> SheetData:
 def extract_sheet(attachment: discord.Attachment, payload: bytes) -> SheetData:
     filename = attachment.filename.casefold()
     content_type = (attachment.content_type or "").casefold()
+
     if filename.endswith(".pdf") or content_type == "application/pdf":
         document = fitz.open(stream=payload, filetype="pdf")
+
+        fields: dict[str, str] = {}
+
+        for page in document:
+            widgets = page.widgets()
+
+            if widgets:
+                for widget in widgets:
+                    if widget.field_name and widget.field_value is not None:
+                        fields[widget.field_name] = str(widget.field_value).strip()
+
+        if fields:
+            stats: dict[str, int] = {}
+
+            field_to_stat = {
+                "STR": "Strength",
+                "DEX": "Dexterity",
+                "CON": "Constitution",
+                "INT": "Intelligence",
+                "WIS": "Wisdom",
+                "CHA": "Charisma",
+            }
+
+            for field_name, stat_name in field_to_stat.items():
+                value = fields.get(field_name)
+
+                if value:
+                    try:
+                        score = int(value)
+
+                        if 1 <= score <= 30:
+                            stats[stat_name] = score
+                    except ValueError:
+                        pass
+
+            name = fields.get("CharacterName")
+
+            level = None
+            class_level = fields.get("CLASS LEVEL", "")
+
+            level_match = re.search(r"(\d{1,2})\s*$", class_level)
+
+            if level_match:
+                parsed_level = int(level_match.group(1))
+
+                if 1 <= parsed_level <= 20:
+                    level = parsed_level
+
+            proficiencies: list[str] = []
+
+            training = fields.get("ProficienciesLang", "")
+
+            if training:
+                sections = re.split(
+                    r"===\s*(?:WEAPONS|TOOLS|LANGUAGES|ARMOR)\s*===",
+                    training,
+                    flags=re.I,
+                )
+
+                for section in sections:
+                    section = section.strip()
+
+                    if not section:
+                        continue
+
+                    entries = [
+                        item.strip()
+                        for item in re.split(r"[,;\n]", section)
+                        if item.strip()
+                    ]
+
+                    for entry in entries:
+                        if entry not in proficiencies:
+                            proficiencies.append(entry)
+
+            return SheetData(
+                name=name,
+                level=level,
+                stats=stats,
+                proficiencies=proficiencies,
+            )
+
         text = "\n".join(page.get_text("text") for page in document)
+
         if len(text.strip()) < 100:
             pages = []
+
             for page in document:
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
-                pages.append(pytesseract.image_to_string(Image.open(io.BytesIO(pix.tobytes("png")))))
+                pix = page.get_pixmap(
+                    matrix=fitz.Matrix(2, 2),
+                    alpha=False,
+                )
+
+                image = Image.open(io.BytesIO(pix.tobytes("png")))
+                pages.append(pytesseract.image_to_string(image))
+
             text = "\n".join(pages)
-    elif content_type.startswith("image/") or filename.endswith((".png", ".jpg", ".jpeg", ".webp")):
-        text = pytesseract.image_to_string(Image.open(io.BytesIO(payload)))
+
+        return parse_sheet_text(text)
+
+    elif content_type.startswith("image/") or filename.endswith(
+        (".png", ".jpg", ".jpeg", ".webp")
+    ):
+        image = Image.open(io.BytesIO(payload))
+        text = pytesseract.image_to_string(image)
+
+        return parse_sheet_text(text)
+
     else:
         raise ValueError("Upload a PDF, PNG, JPG, or WebP file.")
-    return parse_sheet_text(text)
-
 
 class DndBot(commands.Bot):
     def __init__(self) -> None:
