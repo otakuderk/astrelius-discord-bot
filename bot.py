@@ -21,6 +21,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
 log = logging.getLogger("dnd-bot")
 
 
@@ -29,6 +30,14 @@ Slot = Literal["Main", "Alt"]
 SLOTS = [
     app_commands.Choice(name="Main", value="Main"),
     app_commands.Choice(name="Alt", value="Alt"),
+]
+
+DOWNTIME_CHOICES = [
+    app_commands.Choice(name="8", value=8),
+    app_commands.Choice(name="16", value=16),
+    app_commands.Choice(name="24", value=24),
+    app_commands.Choice(name="32", value=32),
+    app_commands.Choice(name="40", value=40),
 ]
 
 LEVEL_THRESHOLDS = {
@@ -64,7 +73,20 @@ RANK_RANGES = {
     "S": range(19, 21),
 }
 
-RANK_ROLE_NAMES = [f"{rank} Rank" for rank in RANK_RANGES]
+RANK_ORDER = (
+    "F",
+    "E",
+    "D",
+    "C",
+    "B",
+    "A",
+    "S",
+)
+
+RANK_ROLE_NAMES = [
+    f"{rank} Rank"
+    for rank in RANK_ORDER
+]
 
 STAT_NAMES = (
     "Strength",
@@ -77,10 +99,12 @@ STAT_NAMES = (
 
 
 def level_for_mp(mp: int) -> int:
+    safe_mp = max(0, mp)
+
     return max(
         level
         for level, threshold in LEVEL_THRESHOLDS.items()
-        if threshold <= max(0, mp)
+        if threshold <= safe_mp
     )
 
 
@@ -92,19 +116,27 @@ def rank_for_level(level: int) -> str:
     )
 
 
-def mp_until_next(level: int, mp: int) -> int:
+def mp_until_next(
+    level: int,
+    mp: int,
+) -> int:
     if level >= 20:
         return 0
 
     return max(
         0,
-        LEVEL_THRESHOLDS[level + 1] - mp,
+        LEVEL_THRESHOLDS[level + 1] - max(0, mp),
     )
 
 
-def staff_only(interaction: discord.Interaction) -> bool:
+def staff_only(
+    interaction: discord.Interaction,
+) -> bool:
     return (
-        isinstance(interaction.user, discord.Member)
+        isinstance(
+            interaction.user,
+            discord.Member,
+        )
         and any(
             role.name.casefold() in {"dm", "gm"}
             for role in interaction.user.roles
@@ -112,7 +144,9 @@ def staff_only(interaction: discord.Interaction) -> bool:
     )
 
 
-async def staff_check(interaction: discord.Interaction) -> bool:
+async def staff_check(
+    interaction: discord.Interaction,
+) -> bool:
     if staff_only(interaction):
         return True
 
@@ -121,22 +155,45 @@ async def staff_check(interaction: discord.Interaction) -> bool:
     )
 
 
+def discord_rank_for_member(
+    member: discord.Member,
+) -> str | None:
+    role_names = {
+        role.name
+        for role in member.roles
+    }
+
+    # Start at S and work downward.
+    # If someone accidentally has multiple rank roles,
+    # the highest one is displayed.
+    for rank in reversed(RANK_ORDER):
+        if f"{rank} Rank" in role_names:
+            return rank
+
+    return None
+
+
 @dataclass
 class SheetData:
     name: str | None
-    level: int | None
+    class_name: str | None
+    subclass_name: str | None
     stats: dict[str, int]
     proficiencies: list[str]
 
 
-def ability_modifier(score: int) -> int:
+def ability_modifier(
+    score: int,
+) -> int:
     return (score - 10) // 2
 
 
-def parse_sheet_text(text: str) -> SheetData:
+def parse_sheet_text(
+    text: str,
+) -> SheetData:
     """
-    Fallback parser for screenshots or PDFs without usable form fields.
-    D&D Beyond PDFs should normally use the structured field parser below.
+    Fallback parser for screenshots or PDFs
+    without readable D&D Beyond form fields.
     """
 
     lines = [
@@ -161,7 +218,8 @@ def parse_sheet_text(text: str) -> SheetData:
             upper = line.upper()
 
             if any(
-                alias == upper or upper.startswith(alias + " ")
+                alias == upper
+                or upper.startswith(alias + " ")
                 for alias in aliases
             ):
                 numbers = re.findall(
@@ -180,30 +238,20 @@ def parse_sheet_text(text: str) -> SheetData:
                             break
 
                 if numbers:
-                    stats[full_name] = int(numbers[0])
+                    stats[full_name] = int(
+                        numbers[0]
+                    )
+
                     break
-
-    level = None
-
-    for line in lines:
-        match = re.search(
-            r"\b(?:TOTAL\s+LEVEL|CHARACTER\s+LEVEL|LEVEL)"
-            r"\s*[:\-]?\s*(\d{1,2})\b",
-            line,
-            re.I,
-        )
-
-        if match:
-            value = int(match.group(1))
-
-            if 1 <= value <= 20:
-                level = value
-                break
 
     name = None
 
     for i, line in enumerate(lines):
-        if re.search(r"CHARACTER\s+NAME", line, re.I):
+        if re.search(
+            r"CHARACTER\s+NAME",
+            line,
+            re.I,
+        ):
             candidate = re.sub(
                 r"CHARACTER\s+NAME\s*[:\-]?",
                 "",
@@ -213,8 +261,41 @@ def parse_sheet_text(text: str) -> SheetData:
 
             if candidate:
                 name = candidate
+
             elif i + 1 < len(lines):
                 name = lines[i + 1]
+
+            break
+
+    class_name = None
+    subclass_name = None
+
+    for line in lines:
+        match = re.search(
+            r"(?:CLASS\s*&\s*LEVEL|CLASS\s+LEVEL)"
+            r"\s*[:\-]?\s*"
+            r"([A-Za-z][A-Za-z '\-]+?)"
+            r"\s+\d{1,2}\b",
+            line,
+            re.I,
+        )
+
+        if match:
+            class_name = match.group(1).strip()
+            break
+
+    for line in lines:
+        match = re.search(
+            r"\b[A-Za-z][A-Za-z '\-]*\s+Subclass\b"
+            r".*?\|\s*([^*|\n]+)",
+            line,
+            re.I,
+        )
+
+        if match:
+            subclass_name = (
+                match.group(1).strip()
+            )
 
             break
 
@@ -224,7 +305,8 @@ def parse_sheet_text(text: str) -> SheetData:
 
     for i, line in enumerate(lines):
         if re.search(
-            r"PROFICIENCIES(?:\s*&\s*(?:LANGUAGES|TRAINING))?",
+            r"PROFICIENCIES"
+            r"(?:\s*&\s*(?:LANGUAGES|TRAINING))?",
             line,
             re.I,
         ):
@@ -287,11 +369,14 @@ def parse_sheet_text(text: str) -> SheetData:
                     1 < len(entry) < 100
                     and entry not in proficiencies
                 ):
-                    proficiencies.append(entry)
+                    proficiencies.append(
+                        entry
+                    )
 
     return SheetData(
         name=name,
-        level=level,
+        class_name=class_name,
+        subclass_name=subclass_name,
         stats=stats,
         proficiencies=proficiencies,
     )
@@ -301,7 +386,10 @@ def extract_sheet(
     attachment: discord.Attachment,
     payload: bytes,
 ) -> SheetData:
-    filename = attachment.filename.casefold()
+    filename = (
+        attachment.filename.casefold()
+    )
+
     content_type = (
         attachment.content_type or ""
     ).casefold()
@@ -326,7 +414,9 @@ def extract_sheet(
                         widget.field_name
                         and widget.field_value is not None
                     ):
-                        fields[widget.field_name] = str(
+                        fields[
+                            widget.field_name
+                        ] = str(
                             widget.field_value
                         ).strip()
 
@@ -347,40 +437,73 @@ def extract_sheet(
                 "CHA": "Charisma",
             }
 
-            for field_name, stat_name in field_to_stat.items():
-                value = fields.get(field_name)
+            for (
+                field_name,
+                stat_name,
+            ) in field_to_stat.items():
+                value = fields.get(
+                    field_name
+                )
 
                 if value:
                     try:
                         score = int(value)
 
                         if 1 <= score <= 30:
-                            stats[stat_name] = score
+                            stats[
+                                stat_name
+                            ] = score
 
                     except ValueError:
                         pass
 
-            name = fields.get("CharacterName")
+            name = fields.get(
+                "CharacterName"
+            )
 
-            level = None
+            # Read class, but DO NOT import level.
+            class_name = None
 
             class_level = fields.get(
                 "CLASS LEVEL",
                 "",
             )
 
-            level_match = re.search(
-                r"(\d{1,2})\s*$",
-                class_level,
+            if class_level:
+                class_name = re.sub(
+                    r"\s+\d{1,2}\s*$",
+                    "",
+                    class_level,
+                ).strip() or None
+
+            # Look through D&D Beyond feature fields
+            # for entries such as:
+            # "Wizard Subclass ... | Occultist"
+            subclass_name = None
+
+            features_text = " ".join(
+                value
+                for key, value in fields.items()
+                if key.startswith(
+                    "FeaturesTraits"
+                )
             )
 
-            if level_match:
-                parsed_level = int(
-                    level_match.group(1)
-                )
+            subclass_match = re.search(
+                r"\b[A-Za-z][A-Za-z '\-]*"
+                r"\s+Subclass\b"
+                r"[^|]{0,120}\|"
+                r"\s*([^*|\n]+)",
+                features_text,
+                re.I,
+            )
 
-                if 1 <= parsed_level <= 20:
-                    level = parsed_level
+            if subclass_match:
+                subclass_name = (
+                    subclass_match
+                    .group(1)
+                    .strip()
+                )
 
             proficiencies: list[str] = []
 
@@ -391,7 +514,9 @@ def extract_sheet(
 
             if training:
                 sections = re.split(
-                    r"===\s*(?:WEAPONS|TOOLS|LANGUAGES|ARMOR)\s*===",
+                    r"===\s*"
+                    r"(?:WEAPONS|TOOLS|LANGUAGES|ARMOR)"
+                    r"\s*===",
                     training,
                     flags=re.I,
                 )
@@ -412,12 +537,18 @@ def extract_sheet(
                     ]
 
                     for entry in entries:
-                        if entry not in proficiencies:
-                            proficiencies.append(entry)
+                        if (
+                            entry
+                            not in proficiencies
+                        ):
+                            proficiencies.append(
+                                entry
+                            )
 
             return SheetData(
                 name=name,
-                level=level,
+                class_name=class_name,
+                subclass_name=subclass_name,
                 stats=stats,
                 proficiencies=proficiencies,
             )
@@ -432,28 +563,40 @@ def extract_sheet(
 
             for page in document:
                 pix = page.get_pixmap(
-                    matrix=fitz.Matrix(2, 2),
+                    matrix=fitz.Matrix(
+                        2,
+                        2,
+                    ),
                     alpha=False,
                 )
 
                 image = Image.open(
                     io.BytesIO(
-                        pix.tobytes("png")
+                        pix.tobytes(
+                            "png"
+                        )
                     )
                 )
 
                 pages.append(
-                    pytesseract.image_to_string(
+                    pytesseract
+                    .image_to_string(
                         image
                     )
                 )
 
-            text = "\n".join(pages)
+            text = "\n".join(
+                pages
+            )
 
-        return parse_sheet_text(text)
+        return parse_sheet_text(
+            text
+        )
 
     if (
-        content_type.startswith("image/")
+        content_type.startswith(
+            "image/"
+        )
         or filename.endswith(
             (
                 ".png",
@@ -467,11 +610,16 @@ def extract_sheet(
             io.BytesIO(payload)
         )
 
-        text = pytesseract.image_to_string(
-            image
+        text = (
+            pytesseract
+            .image_to_string(
+                image
+            )
         )
 
-        return parse_sheet_text(text)
+        return parse_sheet_text(
+            text
+        )
 
     raise ValueError(
         "Upload a PDF, PNG, JPG, or WebP file."
@@ -480,16 +628,24 @@ def extract_sheet(
 
 class DndBot(commands.Bot):
     def __init__(self) -> None:
-        intents = discord.Intents.default()
+        intents = (
+            discord.Intents.default()
+        )
 
         super().__init__(
-            command_prefix=commands.when_mentioned,
+            command_prefix=(
+                commands.when_mentioned
+            ),
             intents=intents,
         )
 
-        self.pool: asyncpg.Pool | None = None
+        self.pool: (
+            asyncpg.Pool | None
+        ) = None
 
-    async def setup_hook(self) -> None:
+    async def setup_hook(
+        self,
+    ) -> None:
         database_url = os.environ[
             "DATABASE_URL"
         ]
@@ -501,23 +657,30 @@ class DndBot(commands.Bot):
                 "json",
                 "jsonb",
             ):
-                await connection.set_type_codec(
-                    type_name,
-                    schema="pg_catalog",
-                    encoder=json.dumps,
-                    decoder=json.loads,
-                    format="text",
+                await (
+                    connection
+                    .set_type_codec(
+                        type_name,
+                        schema="pg_catalog",
+                        encoder=json.dumps,
+                        decoder=json.loads,
+                        format="text",
+                    )
                 )
 
-        self.pool = await asyncpg.create_pool(
-            database_url,
-            min_size=1,
-            max_size=5,
-            command_timeout=30,
-            init=configure_connection,
+        self.pool = (
+            await asyncpg.create_pool(
+                database_url,
+                min_size=1,
+                max_size=5,
+                command_timeout=30,
+                init=configure_connection,
+            )
         )
 
-        async with self.pool.acquire() as connection:
+        async with (
+            self.pool.acquire()
+        ) as connection:
             await connection.execute(
                 SCHEMA
             )
@@ -528,7 +691,9 @@ class DndBot(commands.Bot):
             "Synced global commands"
         )
 
-    async def close(self) -> None:
+    async def close(
+        self,
+    ) -> None:
         if self.pool:
             await self.pool.close()
 
@@ -539,19 +704,43 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS characters (
     guild_id BIGINT NOT NULL,
     user_id BIGINT NOT NULL,
-    slot TEXT NOT NULL CHECK (slot IN ('Main', 'Alt')),
+    slot TEXT NOT NULL CHECK (
+        slot IN ('Main', 'Alt')
+    ),
     character_name TEXT NOT NULL,
-    mp INTEGER NOT NULL DEFAULT 0 CHECK (mp >= 0),
-    level SMALLINT NOT NULL DEFAULT 1 CHECK (level BETWEEN 1 AND 20),
-    rank CHAR(1) NOT NULL DEFAULT 'F' CHECK (rank IN ('F','E','D','C','B','A','S')),
-    gold INTEGER NOT NULL DEFAULT 0 CHECK (gold >= 0),
+    class_name TEXT,
+    subclass_name TEXT,
+    mp INTEGER NOT NULL DEFAULT 0 CHECK (
+        mp >= 0
+    ),
+    level SMALLINT NOT NULL DEFAULT 1 CHECK (
+        level BETWEEN 1 AND 20
+    ),
+    rank CHAR(1) NOT NULL DEFAULT 'F' CHECK (
+        rank IN ('F','E','D','C','B','A','S')
+    ),
+    gold INTEGER NOT NULL DEFAULT 0 CHECK (
+        gold >= 0
+    ),
     materials JSONB NOT NULL DEFAULT '{}'::jsonb,
     proficiencies JSONB NOT NULL DEFAULT '[]'::jsonb,
     stats JSONB NOT NULL DEFAULT '{}'::jsonb,
-    downtime_hours SMALLINT NOT NULL DEFAULT 0 CHECK (downtime_hours BETWEEN 0 AND 40),
+    downtime_hours SMALLINT NOT NULL DEFAULT 0 CHECK (
+        downtime_hours BETWEEN 0 AND 40
+    ),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (guild_id, user_id, slot)
+    PRIMARY KEY (
+        guild_id,
+        user_id,
+        slot
+    )
 );
+
+ALTER TABLE characters
+ADD COLUMN IF NOT EXISTS class_name TEXT;
+
+ALTER TABLE characters
+ADD COLUMN IF NOT EXISTS subclass_name TEXT;
 """
 
 
@@ -587,8 +776,11 @@ async def get_character(
 
     if not row:
         await interaction.followup.send(
-            f"{member.display_name} has no {slot} character yet. "
-            "Use `/character create` first.",
+            (
+                f"{member.display_name} "
+                f"has no {slot} character yet. "
+                "Use `/character create` first."
+            ),
             ephemeral=True,
         )
 
@@ -600,15 +792,17 @@ async def sync_rank_role(
 ) -> str | None:
     guild = member.guild
 
-    highest_level = await db().fetchval(
-        """
-        SELECT COALESCE(MAX(level), 1)
-        FROM characters
-        WHERE guild_id=$1
-        AND user_id=$2
-        """,
-        guild.id,
-        member.id,
+    highest_level = (
+        await db().fetchval(
+            """
+            SELECT COALESCE(MAX(level), 1)
+            FROM characters
+            WHERE guild_id=$1
+            AND user_id=$2
+            """,
+            guild.id,
+            member.id,
+        )
     )
 
     target_name = (
@@ -624,8 +818,10 @@ async def sync_rank_role(
         role
         for role in member.roles
         if (
-            role.name in RANK_ROLE_NAMES
-            and role.name != target_name
+            role.name
+            in RANK_ROLE_NAMES
+            and role.name
+            != target_name
         )
     ]
 
@@ -634,19 +830,20 @@ async def sync_rank_role(
             await member.remove_roles(
                 *removable,
                 reason=(
-                    f"D&D rank updated "
+                    "D&D rank updated "
                     f"to level {highest_level}"
                 ),
             )
 
         if (
             target
-            and target not in member.roles
+            and target
+            not in member.roles
         ):
             await member.add_roles(
                 target,
                 reason=(
-                    f"D&D rank updated "
+                    "D&D rank updated "
                     f"to level {highest_level}"
                 ),
             )
@@ -655,15 +852,31 @@ async def sync_rank_role(
             return None
 
         return (
-            f" The `{target_name}` role "
+            f"The `{target_name}` role "
             "does not exist yet."
         )
 
     except discord.Forbidden:
         return (
-            " I could not update the rank role; "
+            "I could not update the rank role; "
             "move my bot role above all rank roles."
         )
+
+
+async def finish_staff_change_silently(
+    interaction: discord.Interaction,
+) -> None:
+    try:
+        await (
+            interaction
+            .delete_original_response()
+        )
+
+    except (
+        discord.NotFound,
+        discord.HTTPException,
+    ):
+        pass
 
 
 async def mutate_number(
@@ -687,51 +900,86 @@ async def mutate_number(
     if not row:
         return
 
-    current = int(row[field])
+    current = int(
+        row[field]
+    )
 
     if mode == "set":
         new_value = amount
+
     elif mode == "add":
-        new_value = current + amount
+        new_value = (
+            current + amount
+        )
+
     else:
-        new_value = current - amount
-
-    if (
-        field in {"mp", "gold"}
-        and new_value < 0
-    ):
-        await interaction.followup.send(
-            f"That would make {field} negative.",
-            ephemeral=True,
+        new_value = (
+            current - amount
         )
-        return
 
-    if (
-        field == "downtime_hours"
-        and not 0 <= new_value <= 40
-    ):
-        await interaction.followup.send(
-            "Downtime must stay between "
-            "0 and 40 hours.",
-            ephemeral=True,
+    # MP can NEVER go below zero.
+    # Removing more than the character has
+    # simply results in zero.
+    if field == "mp":
+        new_value = max(
+            0,
+            new_value,
         )
-        return
 
-    if (
-        field == "level"
-        and not 1 <= new_value <= 20
-    ):
-        await interaction.followup.send(
-            "Level must stay between 1 and 20.",
-            ephemeral=True,
-        )
-        return
+    elif field == "gold":
+        if new_value < 0:
+            await interaction.followup.send(
+                "That would make gold negative.",
+                ephemeral=True,
+            )
+
+            return
+
+    # Downtime always stays between
+    # zero and forty.
+    elif field == "downtime_hours":
+        if mode == "add":
+            new_value = min(
+                40,
+                new_value,
+            )
+
+        elif mode == "remove":
+            new_value = max(
+                0,
+                new_value,
+            )
+
+        else:
+            new_value = min(
+                40,
+                max(
+                    0,
+                    new_value,
+                ),
+            )
+
+    elif field == "level":
+        if not (
+            1 <= new_value <= 20
+        ):
+            await interaction.followup.send(
+                (
+                    "Level must stay "
+                    "between 1 and 20."
+                ),
+                ephemeral=True,
+            )
+
+            return
 
     role_note = ""
 
     if field == "mp":
-        new_level = level_for_mp(
-            new_value
+        new_level = (
+            level_for_mp(
+                new_value
+            )
         )
 
         await db().execute(
@@ -747,21 +995,27 @@ async def mutate_number(
             """,
             new_value,
             new_level,
-            rank_for_level(new_level),
+            rank_for_level(
+                new_level
+            ),
             interaction.guild_id,
             member.id,
             slot,
         )
 
         role_note = (
-            await sync_rank_role(member)
+            await sync_rank_role(
+                member
+            )
             or ""
         )
 
     elif field == "level":
-        new_mp = LEVEL_THRESHOLDS[
-            new_value
-        ]
+        new_mp = (
+            LEVEL_THRESHOLDS[
+                new_value
+            ]
+        )
 
         await db().execute(
             """
@@ -776,14 +1030,18 @@ async def mutate_number(
             """,
             new_value,
             new_mp,
-            rank_for_level(new_value),
+            rank_for_level(
+                new_value
+            ),
             interaction.guild_id,
             member.id,
             slot,
         )
 
         role_note = (
-            await sync_rank_role(member)
+            await sync_rank_role(
+                member
+            )
             or ""
         )
 
@@ -813,57 +1071,79 @@ async def mutate_number(
             slot,
         )
 
-    await interaction.followup.send(
-        (
-            f"Updated {member.display_name}'s "
-            f"{slot} "
-            f"{field.replace('_', ' ')} "
-            f"to **{new_value}**."
-            f"{role_note}"
-        ),
-        ephemeral=True,
-    )
+    # Only show a response when something
+    # actually went wrong with the role.
+    if role_note:
+        await interaction.followup.send(
+            role_note,
+            ephemeral=True,
+        )
+
+    else:
+        await (
+            finish_staff_change_silently(
+                interaction
+            )
+        )
 
 
 character = app_commands.Group(
     name="character",
-    description="Manage your two character slots",
+    description=(
+        "Manage your two character slots"
+    ),
 )
 
 sheet = app_commands.Group(
     name="sheet",
-    description="Import a D&D Beyond character sheet",
+    description=(
+        "Import a D&D Beyond character sheet"
+    ),
 )
 
 downtime = app_commands.Group(
     name="downtime",
-    description="Manage downtime hours",
+    description=(
+        "Manage downtime hours"
+    ),
 )
 
 mp_group = app_commands.Group(
     name="mp",
-    description="DM/GM MP management",
+    description=(
+        "DM/GM MP management"
+    ),
 )
 
 level_group = app_commands.Group(
     name="level",
-    description="DM/GM level management",
+    description=(
+        "DM/GM level management"
+    ),
 )
 
 gold_group = app_commands.Group(
     name="gold",
-    description="DM/GM gold management",
+    description=(
+        "DM/GM gold management"
+    ),
 )
 
-materials_group = app_commands.Group(
-    name="materials",
-    description="DM/GM material management",
+materials_group = (
+    app_commands.Group(
+        name="materials",
+        description=(
+            "DM/GM material management"
+        ),
+    )
 )
 
 
 @character.command(
     name="create",
-    description="Create or rename your Main or Alt character",
+    description=(
+        "Create or rename your Main or Alt character"
+    ),
 )
 @app_commands.choices(
     slot=SLOTS
@@ -871,7 +1151,11 @@ materials_group = app_commands.Group(
 async def character_create(
     interaction: discord.Interaction,
     slot: app_commands.Choice[str],
-    name: app_commands.Range[str, 1, 60],
+    name: app_commands.Range[
+        str,
+        1,
+        60,
+    ],
 ):
     await db().execute(
         """
@@ -898,18 +1182,24 @@ async def character_create(
         name.strip(),
     )
 
-    await interaction.response.send_message(
-        (
-            f"Your {slot.value} character "
-            f"is now **{name.strip()}**."
-        ),
-        ephemeral=True,
+    await (
+        interaction
+        .response
+        .send_message(
+            (
+                f"Your {slot.value} character "
+                f"is now **{name.strip()}**."
+            ),
+            ephemeral=True,
+        )
     )
 
 
 @character.command(
     name="delete",
-    description="Delete one of your character records",
+    description=(
+        "Delete one of your character records"
+    ),
 )
 @app_commands.choices(
     slot=SLOTS
@@ -920,13 +1210,19 @@ async def character_delete(
     confirmation: str,
 ):
     if confirmation != "DELETE":
-        await interaction.response.send_message(
-            (
-                "Nothing was deleted. "
-                "Type `DELETE` exactly to confirm."
-            ),
-            ephemeral=True,
+        await (
+            interaction
+            .response
+            .send_message(
+                (
+                    "Nothing was deleted. "
+                    "Type `DELETE` exactly "
+                    "to confirm."
+                ),
+                ephemeral=True,
+            )
         )
+
         return
 
     result = await db().execute(
@@ -942,27 +1238,34 @@ async def character_delete(
     )
 
     if result.endswith("1"):
-        role_note = (
-            await sync_rank_role(
-                interaction.user
+        await (
+            interaction
+            .response
+            .send_message(
+                "Character deleted.",
+                ephemeral=True,
             )
-            or ""
         )
 
-        await interaction.response.send_message(
-            f"Character deleted.{role_note}",
-            ephemeral=True,
-        )
     else:
-        await interaction.response.send_message(
-            "That character did not exist.",
-            ephemeral=True,
+        await (
+            interaction
+            .response
+            .send_message(
+                (
+                    "That character "
+                    "did not exist."
+                ),
+                ephemeral=True,
+            )
         )
 
 
 @bot.tree.command(
     name="inventory",
-    description="View your Main or Alt character inventory",
+    description=(
+        "View your Main or Alt character inventory"
+    ),
 )
 @app_commands.choices(
     slot=SLOTS
@@ -996,27 +1299,121 @@ async def inventory(
         row["proficiencies"]
     )
 
+    # MP is the server-side source of truth
+    # for the exact level.
+    server_mp = max(
+        0,
+        int(row["mp"]),
+    )
+
+    server_level = (
+        level_for_mp(
+            server_mp
+        )
+    )
+
+    calculated_rank = (
+        rank_for_level(
+            server_level
+        )
+    )
+
+    # Repair any old DB mismatch automatically.
+    if (
+        int(row["level"])
+        != server_level
+        or str(row["rank"])
+        != calculated_rank
+    ):
+        await db().execute(
+            """
+            UPDATE characters
+            SET level=$1,
+                rank=$2,
+                mp=$3,
+                updated_at=now()
+            WHERE guild_id=$4
+            AND user_id=$5
+            AND slot=$6
+            """,
+            server_level,
+            calculated_rank,
+            server_mp,
+            interaction.guild_id,
+            interaction.user.id,
+            slot.value,
+        )
+
+    # Discord role is the displayed
+    # source of truth for Rank.
+    discord_rank = None
+
+    if isinstance(
+        interaction.user,
+        discord.Member,
+    ):
+        discord_rank = (
+            discord_rank_for_member(
+                interaction.user
+            )
+        )
+
+    display_rank = (
+        discord_rank
+        or calculated_rank
+    )
+
+    class_name = row[
+        "class_name"
+    ]
+
+    subclass_name = row[
+        "subclass_name"
+    ]
+
+    class_line = None
+
+    if (
+        class_name
+        and subclass_name
+    ):
+        class_line = (
+            f"{class_name} • "
+            f"{subclass_name}"
+        )
+
+    elif class_name:
+        class_line = str(
+            class_name
+        )
+
+    elif subclass_name:
+        class_line = str(
+            subclass_name
+        )
+
     embed = discord.Embed(
         title=(
             f"{interaction.user.display_name} "
             f"({slot.value})"
         ),
+        description=class_line,
         color=discord.Color.gold(),
     )
 
     embed.add_field(
         name="Level / Rank",
         value=(
-            f"{row['level']} / "
-            f"{row['rank']}"
+            f"{server_level} / "
+            f"{display_rank}"
         ),
     )
 
     embed.add_field(
         name="MP",
         value=(
-            f"{row['mp']} total\n"
-            f"{mp_until_next(row['level'], row['mp'])} "
+            f"{server_mp} total\n"
+            f"{mp_until_next(server_level, server_mp)} "
             "until next level"
         ),
     )
@@ -1049,24 +1446,31 @@ async def inventory(
     for stat_name in STAT_NAMES:
         if stat_name in stats:
             score = int(
-                stats[stat_name]
+                stats[
+                    stat_name
+                ]
             )
 
-            modifier = ability_modifier(
-                score
+            modifier = (
+                ability_modifier(
+                    score
+                )
             )
 
             stat_lines.append(
                 (
                     f"{stat_abbreviations[stat_name]} "
-                    f"{score} ({modifier:+d})"
+                    f"{score} "
+                    f"({modifier:+d})"
                 )
             )
 
     embed.add_field(
         name="Stats",
         value=(
-            "\n".join(stat_lines)
+            "\n".join(
+                stat_lines
+            )
             or "Not imported"
         ),
         inline=False,
@@ -1088,9 +1492,17 @@ async def inventory(
         name="Materials",
         value=(
             "\n".join(
-                f"{material}: {quantity}"
-                for material, quantity
-                in sorted(materials.items())
+                (
+                    f"{material}: "
+                    f"{quantity}"
+                )
+                for (
+                    material,
+                    quantity,
+                )
+                in sorted(
+                    materials.items()
+                )
             )[:1024]
             or "None"
         ),
@@ -1105,26 +1517,19 @@ async def inventory(
 
 @downtime.command(
     name="spend",
-    description="Spend downtime in 8-hour increments",
+    description=(
+        "Spend downtime hours"
+    ),
 )
 @app_commands.choices(
-    slot=SLOTS
+    slot=SLOTS,
+    hours=DOWNTIME_CHOICES,
 )
 async def downtime_spend(
     interaction: discord.Interaction,
     slot: app_commands.Choice[str],
-    hours: app_commands.Range[int, 8, 40],
+    hours: app_commands.Choice[int],
 ):
-    if hours % 8:
-        await interaction.response.send_message(
-            (
-                "Downtime can only be spent "
-                "in 8-hour increments."
-            ),
-            ephemeral=True,
-        )
-        return
-
     await interaction.response.defer(
         ephemeral=True
     )
@@ -1139,31 +1544,133 @@ async def downtime_spend(
         AND slot=$4
         AND downtime_hours >= $1
         """,
-        hours,
+        hours.value,
         interaction.guild_id,
         interaction.user.id,
         slot.value,
     )
 
     if result.endswith("1"):
-        message = (
-            f"Spent {hours} downtime hours."
-        )
-    else:
-        message = (
-            "Not enough downtime hours, "
-            "or that character does not exist."
+        await (
+            interaction
+            .followup
+            .send(
+                (
+                    f"Spent {hours.value} "
+                    "downtime hours."
+                ),
+                ephemeral=True,
+            )
         )
 
-    await interaction.followup.send(
-        message,
-        ephemeral=True,
+    else:
+        await (
+            interaction
+            .followup
+            .send(
+                (
+                    "Not enough downtime hours, "
+                    "or that character "
+                    "does not exist."
+                ),
+                ephemeral=True,
+            )
+        )
+
+
+@downtime.command(
+    name="add",
+    description=(
+        "Add downtime hours"
+    ),
+)
+@app_commands.choices(
+    slot=SLOTS,
+    hours=DOWNTIME_CHOICES,
+)
+@app_commands.check(
+    staff_check
+)
+async def downtime_add(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    slot: app_commands.Choice[str],
+    hours: app_commands.Choice[int],
+):
+    await mutate_number(
+        interaction,
+        member,
+        slot.value,
+        "downtime_hours",
+        hours.value,
+        "add",
+    )
+
+
+@downtime.command(
+    name="remove",
+    description=(
+        "Remove downtime hours"
+    ),
+)
+@app_commands.choices(
+    slot=SLOTS,
+    hours=DOWNTIME_CHOICES,
+)
+@app_commands.check(
+    staff_check
+)
+async def downtime_remove(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    slot: app_commands.Choice[str],
+    hours: app_commands.Choice[int],
+):
+    await mutate_number(
+        interaction,
+        member,
+        slot.value,
+        "downtime_hours",
+        hours.value,
+        "remove",
+    )
+
+
+@downtime.command(
+    name="set",
+    description=(
+        "Set downtime hours"
+    ),
+)
+@app_commands.choices(
+    slot=SLOTS,
+    hours=DOWNTIME_CHOICES,
+)
+@app_commands.check(
+    staff_check
+)
+async def downtime_set(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    slot: app_commands.Choice[str],
+    hours: app_commands.Choice[int],
+):
+    await mutate_number(
+        interaction,
+        member,
+        slot.value,
+        "downtime_hours",
+        hours.value,
+        "set",
     )
 
 
 @sheet.command(
     name="import",
-    description="Import a D&D Beyond PDF or character-sheet image",
+    description=(
+        "Import a D&D Beyond PDF "
+        "or character-sheet image"
+    ),
 )
 @app_commands.choices(
     slot=SLOTS
@@ -1179,13 +1686,18 @@ async def sheet_import(
     )
 
     if file.size > 12_000_000:
-        await interaction.followup.send(
-            (
-                "Please upload a file "
-                "smaller than 12 MB."
-            ),
-            ephemeral=True,
+        await (
+            interaction
+            .followup
+            .send(
+                (
+                    "Please upload a file "
+                    "smaller than 12 MB."
+                ),
+                ephemeral=True,
+            )
         )
+
         return
 
     existing = await get_character(
@@ -1209,42 +1721,77 @@ async def sheet_import(
             exc,
         )
 
-        await interaction.followup.send(
-            f"I couldn't read that sheet: {exc}",
-            ephemeral=True,
+        await (
+            interaction
+            .followup
+            .send(
+                (
+                    "I couldn't read that sheet: "
+                    f"{exc}"
+                ),
+                ephemeral=True,
+            )
         )
+
         return
 
     if (
         not parsed.stats
         and not parsed.proficiencies
-        and not parsed.level
         and not parsed.name
+        and not parsed.class_name
+        and not parsed.subclass_name
     ):
-        await interaction.followup.send(
-            (
-                "I could not recognize character details. "
-                "Try the exported D&D Beyond PDF; "
-                "it is more reliable than a screenshot."
-            ),
-            ephemeral=True,
+        await (
+            interaction
+            .followup
+            .send(
+                (
+                    "I could not recognize "
+                    "character details. "
+                    "Try the exported "
+                    "D&D Beyond PDF."
+                ),
+                ephemeral=True,
+            )
         )
+
         return
 
+    # IMPORTANT:
+    # D&D Beyond does NOT update:
+    # MP, Level, Rank, Gold,
+    # Materials or Downtime.
     await db().execute(
         """
         UPDATE characters
         SET character_name=$1,
-            stats=$2::jsonb,
-            proficiencies=$3::jsonb,
+            class_name=$2,
+            subclass_name=$3,
+            stats=$4::jsonb,
+            proficiencies=$5::jsonb,
             updated_at=now()
-        WHERE guild_id=$4
-        AND user_id=$5
-        AND slot=$6
+        WHERE guild_id=$6
+        AND user_id=$7
+        AND slot=$8
         """,
         (
             parsed.name
-            or existing["character_name"]
+            or existing[
+                "character_name"
+            ]
+        ),
+        (
+            parsed.class_name
+            or existing[
+                "class_name"
+            ]
+        ),
+        (
+            parsed.subclass_name
+            or existing[
+                "subclass_name"
+            ]
         ),
         parsed.stats,
         parsed.proficiencies,
@@ -1253,14 +1800,18 @@ async def sheet_import(
         slot.value,
     )
 
-    await interaction.followup.send(
-        (
-            f"Updated sheet-derived details "
-            f"for your {slot.value} character. "
-            "Server-controlled MP, level, rank, "
-            "gold, materials, and downtime were preserved."
-        ),
-        ephemeral=True,
+    await (
+        interaction
+        .followup
+        .send(
+            (
+                "Sheet imported. "
+                "Stats, proficiencies, "
+                "class, and subclass updated. "
+                "Server progression was preserved."
+            ),
+            ephemeral=True,
+        )
     )
 
 
@@ -1315,19 +1866,23 @@ def install_numeric_commands(
         slot=SLOTS
     )(remove)
 
-    add_command = group.command(
-        name="add",
-        description=(
-            f"Add {field.replace('_', ' ')}"
-        ),
-    )(add)
+    add_command = (
+        group.command(
+            name="add",
+            description=(
+                f"Add {field.replace('_', ' ')}"
+            ),
+        )(add)
+    )
 
-    remove_command = group.command(
-        name="remove",
-        description=(
-            f"Remove {field.replace('_', ' ')}"
-        ),
-    )(remove)
+    remove_command = (
+        group.command(
+            name="remove",
+            description=(
+                f"Remove {field.replace('_', ' ')}"
+            ),
+        )(remove)
+    )
 
     add_command.add_check(
         staff_check
@@ -1362,12 +1917,15 @@ def install_numeric_commands(
             slot=SLOTS
         )(set_value)
 
-        set_command = group.command(
-            name="set",
-            description=(
-                f"Set {field.replace('_', ' ')}"
-            ),
-        )(set_value)
+        set_command = (
+            group.command(
+                name="set",
+                description=(
+                    f"Set "
+                    f"{field.replace('_', ' ')}"
+                ),
+            )(set_value)
+        )
 
         set_command.add_check(
             staff_check
@@ -1384,15 +1942,13 @@ install_numeric_commands(
     "gold",
 )
 
-install_numeric_commands(
-    downtime,
-    "downtime_hours",
-)
-
 
 @level_group.command(
     name="set",
-    description="Set a character's level and MP to that level's threshold",
+    description=(
+        "Set a character's level and "
+        "MP to that level's threshold"
+    ),
 )
 @app_commands.choices(
     slot=SLOTS
@@ -1404,7 +1960,11 @@ async def level_set(
     interaction: discord.Interaction,
     member: discord.Member,
     slot: app_commands.Choice[str],
-    level: app_commands.Range[int, 1, 20],
+    level: app_commands.Range[
+        int,
+        1,
+        20,
+    ],
 ):
     await mutate_number(
         interaction,
@@ -1418,7 +1978,9 @@ async def level_set(
 
 @materials_group.command(
     name="add",
-    description="Add a material to a character",
+    description=(
+        "Add a material to a character"
+    ),
 )
 @app_commands.choices(
     slot=SLOTS
@@ -1430,8 +1992,16 @@ async def materials_add(
     interaction: discord.Interaction,
     member: discord.Member,
     slot: app_commands.Choice[str],
-    material: app_commands.Range[str, 1, 80],
-    quantity: app_commands.Range[int, 1, 1_000_000],
+    material: app_commands.Range[
+        str,
+        1,
+        80,
+    ],
+    quantity: app_commands.Range[
+        int,
+        1,
+        1_000_000,
+    ],
 ):
     await interaction.response.defer(
         ephemeral=True
@@ -1453,7 +2023,12 @@ async def materials_add(
     key = material.strip()
 
     items[key] = (
-        int(items.get(key, 0))
+        int(
+            items.get(
+                key,
+                0,
+            )
+        )
         + quantity
     )
 
@@ -1472,19 +2047,19 @@ async def materials_add(
         slot.value,
     )
 
-    await interaction.followup.send(
-        (
-            f"{member.display_name}'s "
-            f"{slot.value} now has "
-            f"{items[key]} × {key}."
-        ),
-        ephemeral=True,
+    await (
+        finish_staff_change_silently(
+            interaction
+        )
     )
 
 
 @materials_group.command(
     name="remove",
-    description="Remove a material from a character",
+    description=(
+        "Remove a material "
+        "from a character"
+    ),
 )
 @app_commands.choices(
     slot=SLOTS
@@ -1496,8 +2071,16 @@ async def materials_remove(
     interaction: discord.Interaction,
     member: discord.Member,
     slot: app_commands.Choice[str],
-    material: app_commands.Range[str, 1, 80],
-    quantity: app_commands.Range[int, 1, 1_000_000],
+    material: app_commands.Range[
+        str,
+        1,
+        80,
+    ],
+    quantity: app_commands.Range[
+        int,
+        1,
+        1_000_000,
+    ],
 ):
     await interaction.response.defer(
         ephemeral=True
@@ -1519,23 +2102,34 @@ async def materials_remove(
     key = material.strip()
 
     current = int(
-        items.get(key, 0)
+        items.get(
+            key,
+            0,
+        )
     )
 
     if current < quantity:
-        await interaction.followup.send(
-            (
-                f"Only {current} × "
-                f"{key} is available."
-            ),
-            ephemeral=True,
+        await (
+            interaction
+            .followup
+            .send(
+                (
+                    f"Only {current} × "
+                    f"{key} is available."
+                ),
+                ephemeral=True,
+            )
         )
+
         return
 
-    remaining = current - quantity
+    remaining = (
+        current - quantity
+    )
 
     if remaining:
         items[key] = remaining
+
     else:
         items.pop(
             key,
@@ -1557,13 +2151,10 @@ async def materials_remove(
         slot.value,
     )
 
-    await interaction.followup.send(
-        (
-            f"{member.display_name}'s "
-            f"{slot.value} now has "
-            f"{remaining} × {key}."
-        ),
-        ephemeral=True,
+    await (
+        finish_staff_change_silently(
+            interaction
+        )
     )
 
 
@@ -1586,22 +2177,37 @@ async def on_app_command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ):
-    message = str(error)
+    message = str(
+        error
+    )
 
     log.warning(
         "Command error: %s",
         error,
     )
 
-    if interaction.response.is_done():
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
+    if (
+        interaction
+        .response
+        .is_done()
+    ):
+        await (
+            interaction
+            .followup
+            .send(
+                message,
+                ephemeral=True,
+            )
         )
+
     else:
-        await interaction.response.send_message(
-            message,
-            ephemeral=True,
+        await (
+            interaction
+            .response
+            .send_message(
+                message,
+                ephemeral=True,
+            )
         )
 
 
