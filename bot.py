@@ -2275,8 +2275,8 @@ class QuestRewardSession:
         else:
             embed.set_footer(
                 text=(
-                    "Add players one at a time. "
-                    "Each player can use Main or Alt."
+                    "Players were selected in the slash command. "
+                    "Each player keeps their chosen Main or Alt."
                 )
             )
 
@@ -3086,20 +3086,29 @@ class QuestRewardPanelView(
 
 @bot.tree.command(
     name="questreward",
-    description="Give quest rewards to one or more characters",
+    description="Give the same quest rewards to multiple characters",
 )
 @app_commands.choices(
+    slot1=SLOTS,
+    slot2=SLOTS,
+    slot3=SLOTS,
+    slot4=SLOTS,
+    slot5=SLOTS,
+    slot6=SLOTS,
+    slot7=SLOTS,
+    slot8=SLOTS,
+    slot9=SLOTS,
+    slot10=SLOTS,
     downtime=DOWNTIME_CHOICES,
     mp=QUEST_REWARD_MP_CHOICES,
-    slot=SLOTS,
 )
 @app_commands.check(
     staff_check
 )
 async def questreward(
     interaction: discord.Interaction,
-    player: discord.Member,
-    slot: app_commands.Choice[str],
+    player1: discord.Member,
+    slot1: app_commands.Choice[str],
     downtime: app_commands.Choice[int],
     mp: app_commands.Choice[int],
     gold: app_commands.Range[
@@ -3107,6 +3116,24 @@ async def questreward(
         0,
         1_000_000,
     ],
+    player2: discord.Member | None = None,
+    slot2: app_commands.Choice[str] | None = None,
+    player3: discord.Member | None = None,
+    slot3: app_commands.Choice[str] | None = None,
+    player4: discord.Member | None = None,
+    slot4: app_commands.Choice[str] | None = None,
+    player5: discord.Member | None = None,
+    slot5: app_commands.Choice[str] | None = None,
+    player6: discord.Member | None = None,
+    slot6: app_commands.Choice[str] | None = None,
+    player7: discord.Member | None = None,
+    slot7: app_commands.Choice[str] | None = None,
+    player8: discord.Member | None = None,
+    slot8: app_commands.Choice[str] | None = None,
+    player9: discord.Member | None = None,
+    slot9: app_commands.Choice[str] | None = None,
+    player10: discord.Member | None = None,
+    slot10: app_commands.Choice[str] | None = None,
 ):
     if interaction.guild is None:
         await interaction.response.send_message(
@@ -3115,30 +3142,127 @@ async def questreward(
         )
         return
 
+    pairs = [
+        (player1, slot1),
+        (player2, slot2),
+        (player3, slot3),
+        (player4, slot4),
+        (player5, slot5),
+        (player6, slot6),
+        (player7, slot7),
+        (player8, slot8),
+        (player9, slot9),
+        (player10, slot10),
+    ]
+
+    # If an optional player is chosen, require their Main/Alt slot too.
+    missing_slots = [
+        index
+        for index, (member, slot)
+        in enumerate(
+            pairs,
+            start=1,
+        )
+        if (
+            member is not None
+            and slot is None
+        )
+    ]
+
+    if missing_slots:
+        numbers = ", ".join(
+            str(number)
+            for number in missing_slots
+        )
+
+        await interaction.response.send_message(
+            (
+                "Choose Main or Alt for "
+                f"player slot(s): {numbers}."
+            ),
+            ephemeral=True,
+        )
+        return
+
+    # Ignore empty optional positions.
+    selected_pairs = [
+        (member, slot)
+        for member, slot in pairs
+        if (
+            member is not None
+            and slot is not None
+        )
+    ]
+
+    # Stop accidental duplicate copies of the same exact character.
+    seen: set[
+        tuple[int, str]
+    ] = set()
+
+    duplicates: list[str] = []
+
+    for member, slot in selected_pairs:
+        key = (
+            member.id,
+            slot.value,
+        )
+
+        if key in seen:
+            duplicates.append(
+                (
+                    f"{member.display_name} "
+                    f"({slot.value})"
+                )
+            )
+
+        seen.add(
+            key
+        )
+
+    if duplicates:
+        await interaction.response.send_message(
+            (
+                "The same character was selected more than once:\n"
+                + "\n".join(
+                    f"• {item}"
+                    for item in duplicates
+                )
+            ),
+            ephemeral=True,
+        )
+        return
+
     session = QuestRewardSession(
         guild=interaction.guild,
-        staff_user_id=interaction.user.id,
+        staff_user_id=(
+            interaction.user.id
+        ),
         mp_reward=mp.value,
         gold_reward=gold,
-        downtime_reward=downtime.value,
+        downtime_reward=(
+            downtime.value
+        ),
     )
 
-    session.recipients.append(
-        QuestRewardRecipient(
-            user_id=player.id,
-            display_name=player.display_name,
-            slot=slot.value,
+    for member, slot in selected_pairs:
+        session.recipients.append(
+            QuestRewardRecipient(
+                user_id=member.id,
+                display_name=(
+                    member.display_name
+                ),
+                slot=slot.value,
+            )
         )
-    )
 
     await interaction.response.send_message(
-        embed=session.summary_embed(),
-        view=QuestRewardPanelView(session),
+        embed=session.summary_embed(
+            confirmation=True
+        ),
+        view=QuestRewardConfirmView(
+            session
+        ),
         ephemeral=True,
-    )
-
-    session.panel_message = (
-        await interaction.original_response()
     )
 
 
