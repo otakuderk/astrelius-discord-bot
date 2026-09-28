@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -2064,111 +2065,6 @@ async def sheet_import(
 # CHARACTER SHEET BOARD
 # =========================================================
 
-class SheetUploadModal(discord.ui.Modal):
-    def __init__(
-        self,
-        *,
-        user_id: int,
-        guild_id: int,
-        slot: str,
-    ) -> None:
-        super().__init__(
-            title="Upload Character Sheet",
-            timeout=300,
-        )
-
-        self.user_id = user_id
-        self.guild_id = guild_id
-        self.slot = slot
-
-        file_upload_type = getattr(
-            discord.ui,
-            "FileUpload",
-            None,
-        )
-
-        label_type = getattr(
-            discord.ui,
-            "Label",
-            None,
-        )
-
-        if file_upload_type is None:
-            raise RuntimeError(
-                "Character-sheet file upload requires discord.py 2.7 or newer."
-            )
-
-        self.file_upload = file_upload_type(
-            custom_id="astrelius:sheetupload:file",
-            required=True,
-            min_values=1,
-            max_values=1,
-        )
-
-        if label_type is not None:
-            self.add_item(
-                label_type(
-                    text="D&D Beyond Sheet",
-                    description="Upload a PDF, PNG, JPG, or WebP file.",
-                    component=self.file_upload,
-                )
-            )
-        else:
-            self.add_item(
-                self.file_upload
-            )
-
-    async def interaction_check(
-        self,
-        interaction: discord.Interaction,
-    ) -> bool:
-        if (
-            interaction.user.id == self.user_id
-            and interaction.guild_id == self.guild_id
-        ):
-            return True
-
-        await interaction.response.send_message(
-            "This sheet upload belongs to another player.",
-            ephemeral=True,
-        )
-        return False
-
-    async def on_submit(
-        self,
-        interaction: discord.Interaction,
-    ) -> None:
-        values = list(
-            self.file_upload.values
-        )
-
-        if not values:
-            await interaction.response.send_message(
-                "Choose a file first.",
-                ephemeral=True,
-            )
-            return
-
-        attachment = values[0]
-
-        await interaction.response.defer(
-            ephemeral=True,
-            thinking=True,
-        )
-
-        _, message = await import_character_sheet(
-            guild_id=self.guild_id,
-            user_id=self.user_id,
-            slot=self.slot,
-            file=attachment,
-        )
-
-        await interaction.followup.send(
-            message,
-            ephemeral=True,
-        )
-
-
 class SheetSessionView(discord.ui.View):
     def __init__(
         self,
@@ -2181,6 +2077,7 @@ class SheetSessionView(discord.ui.View):
         self.user_id = user_id
         self.guild_id = guild_id
         self.selected_slot: str | None = None
+        self.waiting_for_upload = False
 
         self.slot_select = discord.ui.Select(
             placeholder="Choose Main or Alt",
@@ -2200,14 +2097,14 @@ class SheetSessionView(discord.ui.View):
         )
 
         self.upload_button = discord.ui.Button(
-            label="Select File",
+            label="Upload File",
             emoji="📄",
             style=discord.ButtonStyle.success,
             row=1,
         )
 
         self.slot_select.callback = self.slot_changed
-        self.upload_button.callback = self.open_upload
+        self.upload_button.callback = self.start_upload
 
         self.add_item(self.slot_select)
         self.add_item(self.upload_button)
@@ -2235,7 +2132,7 @@ class SheetSessionView(discord.ui.View):
         self.selected_slot = self.slot_select.values[0]
         await interaction.response.defer()
 
-    async def open_upload(
+    async def start_upload(
         self,
         interaction: discord.Interaction,
     ) -> None:
@@ -2246,36 +2143,80 @@ class SheetSessionView(discord.ui.View):
             )
             return
 
-        if getattr(
-            discord.ui,
-            "FileUpload",
-            None,
-        ) is None:
+        if self.waiting_for_upload:
             await interaction.response.send_message(
-                (
-                    "This upload button requires **discord.py 2.7 or newer**. "
-                    "Update the discord.py version used by Railway, then redeploy."
-                ),
+                "I am already waiting for your sheet file.",
                 ephemeral=True,
             )
             return
+
+        if interaction.channel is None:
+            await interaction.response.send_message(
+                "I could not access this channel.",
+                ephemeral=True,
+            )
+            return
+
+        self.waiting_for_upload = True
+        slot = self.selected_slot
+        channel_id = interaction.channel.id
+
+        await interaction.response.edit_message(
+            content=(
+                f"Upload the D&D Beyond PDF or character-sheet image "
+                f"for your **{slot}** character in this channel.\n"
+                "I will use the next file you upload here."
+            ),
+            embed=None,
+            view=None,
+        )
+
+        def check(message: discord.Message) -> bool:
+            return (
+                message.author.id == self.user_id
+                and message.channel.id == channel_id
+                and bool(message.attachments)
+            )
 
         try:
-            modal = SheetUploadModal(
-                user_id=self.user_id,
-                guild_id=self.guild_id,
-                slot=self.selected_slot,
+            message = await bot.wait_for(
+                "message",
+                check=check,
+                timeout=120,
             )
 
-        except RuntimeError as exc:
-            await interaction.response.send_message(
-                str(exc),
+        except asyncio.TimeoutError:
+            self.waiting_for_upload = False
+            await interaction.followup.send(
+                "Sheet upload timed out. Press **Upload Sheet** and try again.",
                 ephemeral=True,
             )
             return
 
-        await interaction.response.send_modal(
-            modal
+        attachment = message.attachments[0]
+
+        _, result_message = await import_character_sheet(
+            guild_id=self.guild_id,
+            user_id=self.user_id,
+            slot=slot,
+            file=attachment,
+        )
+
+        # Keep the channel tidy when the bot has permission to delete the upload.
+        try:
+            await message.delete()
+        except (
+            discord.Forbidden,
+            discord.NotFound,
+            discord.HTTPException,
+        ):
+            pass
+
+        self.waiting_for_upload = False
+
+        await interaction.followup.send(
+            result_message,
+            ephemeral=True,
         )
 
 
@@ -2303,7 +2244,7 @@ class SheetBoardView(discord.ui.View):
 
         embed = discord.Embed(
             title="📄 Character Sheet",
-            description="Choose your character, then select your sheet file.",
+            description="Choose your character, then upload the sheet file.",
             color=discord.Color.gold(),
         )
 
