@@ -54,12 +54,12 @@ QUEST_REWARD_MP_CHOICES = [
 
 
 JOB_CHOICES = [
-    app_commands.Choice(name="Soldier", value="Soldier"),
-    app_commands.Choice(name="Thief", value="Thief"),
-    app_commands.Choice(name="Farmer", value="Farmer"),
-    app_commands.Choice(name="Teacher", value="Teacher"),
-    app_commands.Choice(name="Priest", value="Priest"),
-    app_commands.Choice(name="Performer", value="Performer"),
+    app_commands.Choice(name="Soldier (Strength)", value="Soldier"),
+    app_commands.Choice(name="Thief (Dexterity)", value="Thief"),
+    app_commands.Choice(name="Farmer (Constitution)", value="Farmer"),
+    app_commands.Choice(name="Teacher (Intelligence)", value="Teacher"),
+    app_commands.Choice(name="Priest (Wisdom)", value="Priest"),
+    app_commands.Choice(name="Performer (Charisma)", value="Performer"),
 ]
 
 JOB_ABILITIES = {
@@ -907,6 +907,8 @@ async def get_character(
     interaction: discord.Interaction,
     member: discord.Member,
     slot: str,
+    *,
+    ephemeral: bool = True,
 ):
     row = await db().fetchrow(
         """
@@ -928,7 +930,7 @@ async def get_character(
                 f"has no {slot} character yet. "
                 "Use `/character create` first."
             ),
-            ephemeral=True,
+            ephemeral=ephemeral,
         )
 
     return row
@@ -1320,7 +1322,7 @@ async def character_create(
             f"Your {slot.value} character "
             f"is now **{name.strip()}**."
         ),
-        ephemeral=True,
+        ephemeral=False,
     )
 
 
@@ -1342,7 +1344,7 @@ async def character_delete(
                 "Nothing was deleted. "
                 "Type `DELETE` exactly to confirm."
             ),
-            ephemeral=True,
+            ephemeral=False,
         )
 
         return
@@ -1362,13 +1364,13 @@ async def character_delete(
     if result.endswith("1"):
         await interaction.response.send_message(
             "Character deleted.",
-            ephemeral=True,
+            ephemeral=False,
         )
 
     else:
         await interaction.response.send_message(
             "That character did not exist.",
-            ephemeral=True,
+            ephemeral=False,
         )
 
 
@@ -1388,13 +1390,14 @@ async def inventory(
     slot: app_commands.Choice[str],
 ):
     await interaction.response.defer(
-        ephemeral=True
+        ephemeral=False
     )
 
     row = await get_character(
         interaction,
         interaction.user,
         slot.value,
+        ephemeral=False,
     )
 
     if not row:
@@ -1619,7 +1622,7 @@ async def inventory(
 
     await interaction.followup.send(
         embed=embed,
-        ephemeral=True,
+        ephemeral=False,
     )
 
 
@@ -1731,14 +1734,14 @@ async def sheet_import(
     file: discord.Attachment,
 ):
     await interaction.response.defer(
-        ephemeral=True,
+        ephemeral=False,
         thinking=True,
     )
 
     if file.size > 12_000_000:
         await interaction.followup.send(
             "Please upload a file smaller than 12 MB.",
-            ephemeral=True,
+            ephemeral=False,
         )
 
         return
@@ -1747,6 +1750,7 @@ async def sheet_import(
         interaction,
         interaction.user,
         slot.value,
+        ephemeral=False,
     )
 
     if not existing:
@@ -1766,7 +1770,7 @@ async def sheet_import(
 
         await interaction.followup.send(
             f"I couldn't read that sheet: {exc}",
-            ephemeral=True,
+            ephemeral=False,
         )
 
         return
@@ -1783,7 +1787,7 @@ async def sheet_import(
                 "I could not recognize character details. "
                 "Try the exported D&D Beyond PDF."
             ),
-            ephemeral=True,
+            ephemeral=False,
         )
 
         return
@@ -1842,7 +1846,7 @@ async def sheet_import(
             "Class, subclass, stats, and proficiencies updated. "
             "Server progression was preserved."
         ),
-        ephemeral=True,
+        ephemeral=False,
     )
 
 
@@ -2214,12 +2218,12 @@ async def job_command(
     if interaction.guild_id is None:
         await interaction.response.send_message(
             "Use this command inside the server.",
-            ephemeral=True,
+            ephemeral=False,
         )
         return
 
     await interaction.response.defer(
-        ephemeral=True,
+        ephemeral=False,
         thinking=True,
     )
 
@@ -2247,7 +2251,7 @@ async def job_command(
                         f"You do not have a {slot.value} character yet. "
                         "Use `/character create` first."
                     ),
-                    ephemeral=True,
+                    ephemeral=False,
                 )
                 return
 
@@ -2260,7 +2264,7 @@ async def job_command(
                         f"on your {slot.value} character, but this job needs "
                         f"**{hours.value}**."
                     ),
-                    ephemeral=True,
+                    ephemeral=False,
                 )
                 return
 
@@ -2273,7 +2277,7 @@ async def job_command(
                         f"**{ability_name}** score yet. Import the character sheet "
                         "before using this job."
                     ),
-                    ephemeral=True,
+                    ephemeral=False,
                 )
                 return
 
@@ -2368,10 +2372,10 @@ async def job_command(
         )
 
     embed = discord.Embed(
-        title=f"💼 {job.value} Work",
+        title=f"💼 {job.value} ({ability_name}) Work",
         description=(
             f"**{row['character_name']}** worked as a "
-            f"**{job.value}**."
+            f"**{job.value} ({ability_name})**."
         ),
         color=discord.Color.gold(),
     )
@@ -2406,7 +2410,7 @@ async def job_command(
 
     await interaction.followup.send(
         embed=embed,
-        ephemeral=True,
+        ephemeral=False,
     )
 
 
