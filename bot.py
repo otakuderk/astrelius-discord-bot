@@ -83,6 +83,30 @@ JOB_RANK_PAY = {
 
 JOB_DC = 16
 
+TRAINING_TYPE_CHOICES = [
+    app_commands.Choice(
+        name="Language / Proficiency (50 Gold, 10 weeks)",
+        value="Language / Proficiency",
+    ),
+    app_commands.Choice(
+        name="Feat (200 Gold, 15 weeks)",
+        value="Feat",
+    ),
+]
+
+TRAINING_RULES = {
+    "Language / Proficiency": {
+        "cost": 50,
+        "weeks": 10,
+    },
+    "Feat": {
+        "cost": 200,
+        "weeks": 15,
+    },
+}
+
+TRAINING_DOWNTIME_COST = 40
+
 LEVEL_THRESHOLDS = {
     1: 0,
     2: 2,
@@ -874,6 +898,12 @@ CREATE TABLE IF NOT EXISTS characters (
         downtime_hours BETWEEN 0 AND 40
     ),
 
+    training_name TEXT,
+    training_type TEXT,
+    training_week SMALLINT NOT NULL DEFAULT 0 CHECK (
+        training_week BETWEEN 0 AND 15
+    ),
+
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
 
     PRIMARY KEY (
@@ -888,6 +918,15 @@ ADD COLUMN IF NOT EXISTS class_name TEXT;
 
 ALTER TABLE characters
 ADD COLUMN IF NOT EXISTS subclass_name TEXT;
+
+ALTER TABLE characters
+ADD COLUMN IF NOT EXISTS training_name TEXT;
+
+ALTER TABLE characters
+ADD COLUMN IF NOT EXISTS training_type TEXT;
+
+ALTER TABLE characters
+ADD COLUMN IF NOT EXISTS training_week SMALLINT NOT NULL DEFAULT 0;
 """
 
 
@@ -2410,6 +2449,701 @@ async def job_command(
 
     await interaction.followup.send(
         embed=embed,
+        ephemeral=False,
+    )
+
+
+# =========================================================
+# TRAINING
+# =========================================================
+
+
+def training_embed(
+    *,
+    character_name: str,
+    slot: str,
+    training_name: str,
+    training_type: str,
+    current_week: int,
+    gold: int,
+    downtime: int,
+) -> discord.Embed:
+    rules = TRAINING_RULES[training_type]
+    cost = int(rules["cost"])
+    total_weeks = int(rules["weeks"])
+    next_week = current_week + 1
+
+    embed = discord.Embed(
+        title="📚 Confirm Training",
+        description=(
+            f"**{character_name}** ({slot}) is preparing to train "
+            f"**{training_name}**."
+        ),
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="Training",
+        value=(
+            f"**Type:** {training_type}\n"
+            f"**Progress after this session:** Week {next_week} / {total_weeks}"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Cost",
+        value=(
+            f"**Gold:** {cost}\n"
+            f"**Downtime:** {TRAINING_DOWNTIME_COST} hours"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Current Resources",
+        value=(
+            f"**Gold:** {gold}\n"
+            f"**Downtime:** {downtime} / 40"
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="Nothing is spent until you confirm."
+    )
+    return embed
+
+
+class TrainingConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+        slot: str,
+        training_name: str,
+        training_type: str,
+        expected_week: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.slot = slot
+        self.training_name = training_name
+        self.training_type = training_type
+        self.expected_week = expected_week
+        self.processed = False
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+
+        await interaction.response.send_message(
+            "Only the player who started this training can use these buttons.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Confirm Training",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processed:
+            await interaction.response.send_message(
+                "This training session has already been processed.",
+                ephemeral=True,
+            )
+            return
+
+        self.processed = True
+        await interaction.response.defer(thinking=True)
+
+        rules = TRAINING_RULES[self.training_type]
+        cost = int(rules["cost"])
+        total_weeks = int(rules["weeks"])
+
+        async with db().acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT *
+                    FROM characters
+                    WHERE guild_id=$1
+                    AND user_id=$2
+                    AND slot=$3
+                    FOR UPDATE
+                    """,
+                    self.guild_id,
+                    self.user_id,
+                    self.slot,
+                )
+
+                if not row:
+                    await interaction.edit_original_response(
+                        content=(
+                            f"Your {self.slot} character no longer exists."
+                        ),
+                        embed=None,
+                        view=None,
+                    )
+                    return
+
+                active_name = row["training_name"]
+                active_type = row["training_type"]
+                current_week = int(row["training_week"] or 0)
+
+                if active_name:
+                    same_training = (
+                        str(active_name).casefold()
+                        == self.training_name.casefold()
+                        and str(active_type) == self.training_type
+                    )
+
+                    if not same_training:
+                        await interaction.edit_original_response(
+                            content=(
+                                "Your active training changed before this was confirmed. "
+                                "Run `/train` again."
+                            ),
+                            embed=None,
+                            view=None,
+                        )
+                        return
+                else:
+                    current_week = 0
+
+                if current_week != self.expected_week:
+                    await interaction.edit_original_response(
+                        content=(
+                            "Your training progress changed before this was confirmed. "
+                            "Run `/train` again."
+                        ),
+                        embed=None,
+                        view=None,
+                    )
+                    return
+
+                current_gold = int(row["gold"])
+                current_downtime = int(row["downtime_hours"])
+
+                if current_downtime < TRAINING_DOWNTIME_COST:
+                    await interaction.edit_original_response(
+                        content=(
+                            "You need **40 downtime hours** to train for a week. "
+                            f"You currently have **{current_downtime}**."
+                        ),
+                        embed=None,
+                        view=None,
+                    )
+                    return
+
+                if current_gold < cost:
+                    await interaction.edit_original_response(
+                        content=(
+                            f"You need **{cost} Gold** for this training week. "
+                            f"You currently have **{current_gold} Gold**."
+                        ),
+                        embed=None,
+                        view=None,
+                    )
+                    return
+
+                next_week = current_week + 1
+                completed = next_week >= total_weeks
+                new_gold = current_gold - cost
+                new_downtime = current_downtime - TRAINING_DOWNTIME_COST
+
+                if completed:
+                    await connection.execute(
+                        """
+                        UPDATE characters
+                        SET gold=$1,
+                            downtime_hours=$2,
+                            training_name=NULL,
+                            training_type=NULL,
+                            training_week=0,
+                            updated_at=now()
+                        WHERE guild_id=$3
+                        AND user_id=$4
+                        AND slot=$5
+                        """,
+                        new_gold,
+                        new_downtime,
+                        self.guild_id,
+                        self.user_id,
+                        self.slot,
+                    )
+                else:
+                    await connection.execute(
+                        """
+                        UPDATE characters
+                        SET gold=$1,
+                            downtime_hours=$2,
+                            training_name=$3,
+                            training_type=$4,
+                            training_week=$5,
+                            updated_at=now()
+                        WHERE guild_id=$6
+                        AND user_id=$7
+                        AND slot=$8
+                        """,
+                        new_gold,
+                        new_downtime,
+                        self.training_name,
+                        self.training_type,
+                        next_week,
+                        self.guild_id,
+                        self.user_id,
+                        self.slot,
+                    )
+
+                character_name = str(row["character_name"])
+
+        result = discord.Embed(
+            title=(
+                "🎓 Training Complete!"
+                if completed
+                else "📚 Training Week Complete"
+            ),
+            description=(
+                f"**{character_name}** trained **{self.training_name}**."
+            ),
+            color=discord.Color.gold(),
+        )
+
+        result.add_field(
+            name="Progress",
+            value=(
+                f"**Type:** {self.training_type}\n"
+                f"**Week:** {next_week} / {total_weeks}"
+            ),
+            inline=False,
+        )
+
+        result.add_field(
+            name="Spent",
+            value=(
+                f"**Gold:** {cost}\n"
+                f"**Downtime:** {TRAINING_DOWNTIME_COST} hours"
+            ),
+            inline=False,
+        )
+
+        result.add_field(
+            name="Remaining",
+            value=(
+                f"**Gold:** {new_gold}\n"
+                f"**Downtime:** {new_downtime} / 40"
+            ),
+            inline=False,
+        )
+
+        if completed:
+            result.add_field(
+                name="Finished",
+                value=(
+                    "The bot has cleared the active training record. "
+                    "Add the completed language, proficiency, or feat to your "
+                    "D&D Beyond sheet yourself."
+                ),
+                inline=False,
+            )
+
+        await interaction.edit_original_response(
+            content=None,
+            embed=result,
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="Deny",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def deny(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processed:
+            await interaction.response.send_message(
+                "This training session has already been processed.",
+                ephemeral=True,
+            )
+            return
+
+        self.processed = True
+        await interaction.response.edit_message(
+            content="Training was not started. Nothing was spent.",
+            embed=None,
+            view=None,
+        )
+
+
+class CancelTrainingConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+        slot: str,
+        training_name: str,
+        training_type: str,
+        training_week: int,
+    ) -> None:
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.slot = slot
+        self.training_name = training_name
+        self.training_type = training_type
+        self.training_week = training_week
+        self.processed = False
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+
+        await interaction.response.send_message(
+            "Only the player who owns this training can use these buttons.",
+            ephemeral=True,
+        )
+        return False
+
+    @discord.ui.button(
+        label="Confirm Cancel",
+        emoji="🗑️",
+        style=discord.ButtonStyle.danger,
+    )
+    async def confirm_cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processed:
+            await interaction.response.send_message(
+                "This cancellation has already been processed.",
+                ephemeral=True,
+            )
+            return
+
+        self.processed = True
+        await interaction.response.defer(thinking=True)
+
+        async with db().acquire() as connection:
+            async with connection.transaction():
+                row = await connection.fetchrow(
+                    """
+                    SELECT training_name, training_type, training_week
+                    FROM characters
+                    WHERE guild_id=$1
+                    AND user_id=$2
+                    AND slot=$3
+                    FOR UPDATE
+                    """,
+                    self.guild_id,
+                    self.user_id,
+                    self.slot,
+                )
+
+                if not row or not row["training_name"]:
+                    await interaction.edit_original_response(
+                        content="There is no active training to cancel.",
+                        embed=None,
+                        view=None,
+                    )
+                    return
+
+                if (
+                    str(row["training_name"]).casefold()
+                    != self.training_name.casefold()
+                    or str(row["training_type"]) != self.training_type
+                    or int(row["training_week"] or 0) != self.training_week
+                ):
+                    await interaction.edit_original_response(
+                        content=(
+                            "Your training changed before this cancellation was confirmed. "
+                            "Run `/canceltraining` again."
+                        ),
+                        embed=None,
+                        view=None,
+                    )
+                    return
+
+                await connection.execute(
+                    """
+                    UPDATE characters
+                    SET training_name=NULL,
+                        training_type=NULL,
+                        training_week=0,
+                        updated_at=now()
+                    WHERE guild_id=$1
+                    AND user_id=$2
+                    AND slot=$3
+                    """,
+                    self.guild_id,
+                    self.user_id,
+                    self.slot,
+                )
+
+        await interaction.edit_original_response(
+            content=(
+                f"Training for **{self.training_name}** was cancelled. "
+                "Previous gold and downtime were not refunded."
+            ),
+            embed=None,
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="Keep Training",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def keep_training(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.processed:
+            await interaction.response.send_message(
+                "This cancellation has already been processed.",
+                ephemeral=True,
+            )
+            return
+
+        self.processed = True
+        await interaction.response.edit_message(
+            content="Training kept. No progress was changed.",
+            embed=None,
+            view=None,
+        )
+
+
+@bot.tree.command(
+    name="train",
+    description="Spend 40 downtime hours to advance your current training",
+)
+@app_commands.choices(
+    slot=SLOTS,
+    training_type=TRAINING_TYPE_CHOICES,
+)
+async def train_command(
+    interaction: discord.Interaction,
+    slot: app_commands.Choice[str],
+    training: app_commands.Range[str, 1, 100],
+    training_type: app_commands.Choice[str],
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=False,
+        )
+        return
+
+    training_name = training.strip()
+    rules = TRAINING_RULES[training_type.value]
+    cost = int(rules["cost"])
+    total_weeks = int(rules["weeks"])
+
+    row = await db().fetchrow(
+        """
+        SELECT *
+        FROM characters
+        WHERE guild_id=$1
+        AND user_id=$2
+        AND slot=$3
+        """,
+        interaction.guild_id,
+        interaction.user.id,
+        slot.value,
+    )
+
+    if not row:
+        await interaction.response.send_message(
+            (
+                f"You do not have a {slot.value} character yet. "
+                "Use `/character create` first."
+            ),
+            ephemeral=False,
+        )
+        return
+
+    active_name = row["training_name"]
+    active_type = row["training_type"]
+    current_week = int(row["training_week"] or 0)
+
+    if active_name:
+        same_training = (
+            str(active_name).casefold() == training_name.casefold()
+            and str(active_type) == training_type.value
+        )
+
+        if not same_training:
+            await interaction.response.send_message(
+                (
+                    f"Your {slot.value} character is already training "
+                    f"**{active_name}** ({active_type}) at Week {current_week}.\n"
+                    "Use `/canceltraining` first if you want to train something else."
+                ),
+                ephemeral=False,
+            )
+            return
+
+    else:
+        current_week = 0
+
+    if current_week >= total_weeks:
+        await interaction.response.send_message(
+            "That training is already complete. Start a new training subject.",
+            ephemeral=False,
+        )
+        return
+
+    current_gold = int(row["gold"])
+    current_downtime = int(row["downtime_hours"])
+
+    if current_downtime < TRAINING_DOWNTIME_COST:
+        await interaction.response.send_message(
+            (
+                "You need **40 downtime hours** to train for one week. "
+                f"You currently have **{current_downtime}**."
+            ),
+            ephemeral=False,
+        )
+        return
+
+    if current_gold < cost:
+        await interaction.response.send_message(
+            (
+                f"You need **{cost} Gold** for this training week. "
+                f"You currently have **{current_gold} Gold**."
+            ),
+            ephemeral=False,
+        )
+        return
+
+    await interaction.response.send_message(
+        embed=training_embed(
+            character_name=str(row["character_name"]),
+            slot=slot.value,
+            training_name=training_name,
+            training_type=training_type.value,
+            current_week=current_week,
+            gold=current_gold,
+            downtime=current_downtime,
+        ),
+        view=TrainingConfirmView(
+            user_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            slot=slot.value,
+            training_name=training_name,
+            training_type=training_type.value,
+            expected_week=current_week,
+        ),
+        ephemeral=False,
+    )
+
+
+@bot.tree.command(
+    name="canceltraining",
+    description="Erase your current training progress so you can train something else",
+)
+@app_commands.choices(
+    slot=SLOTS,
+)
+async def cancel_training_command(
+    interaction: discord.Interaction,
+    slot: app_commands.Choice[str],
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=False,
+        )
+        return
+
+    row = await db().fetchrow(
+        """
+        SELECT character_name, training_name, training_type, training_week
+        FROM characters
+        WHERE guild_id=$1
+        AND user_id=$2
+        AND slot=$3
+        """,
+        interaction.guild_id,
+        interaction.user.id,
+        slot.value,
+    )
+
+    if not row:
+        await interaction.response.send_message(
+            (
+                f"You do not have a {slot.value} character yet. "
+                "Use `/character create` first."
+            ),
+            ephemeral=False,
+        )
+        return
+
+    if not row["training_name"]:
+        await interaction.response.send_message(
+            f"Your {slot.value} character does not have active training.",
+            ephemeral=False,
+        )
+        return
+
+    training_name = str(row["training_name"])
+    training_type = str(row["training_type"])
+    training_week = int(row["training_week"] or 0)
+    total_weeks = int(TRAINING_RULES[training_type]["weeks"])
+
+    embed = discord.Embed(
+        title="🗑️ Cancel Current Training?",
+        description=(
+            f"**{row['character_name']}** is currently training "
+            f"**{training_name}**."
+        ),
+        color=discord.Color.gold(),
+    )
+    embed.add_field(
+        name="Current Progress",
+        value=(
+            f"**Type:** {training_type}\n"
+            f"**Week:** {training_week} / {total_weeks}"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Warning",
+        value=(
+            "All current training progress will be erased. "
+            "Previously spent gold and downtime will not be refunded."
+        ),
+        inline=False,
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=CancelTrainingConfirmView(
+            user_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            slot=slot.value,
+            training_name=training_name,
+            training_type=training_type,
+            training_week=training_week,
+        ),
         ephemeral=False,
     )
 
