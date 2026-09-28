@@ -841,6 +841,9 @@ class DndBot(commands.Bot):
                 SCHEMA
             )
 
+        # Re-register persistent UI views after every restart.
+        self.add_view(JobBoardView())
+
         await self.tree.sync()
 
         log.info(
@@ -2239,34 +2242,22 @@ async def materials_remove(
 # DOWNTIME JOBS
 # =========================================================
 
-@bot.tree.command(
-    name="job",
-    description="Spend downtime working a job to earn gold",
-)
-@app_commands.choices(
-    slot=SLOTS,
-    job=JOB_CHOICES,
-    hours=DOWNTIME_CHOICES,
-)
-async def job_command(
-    interaction: discord.Interaction,
-    slot: app_commands.Choice[str],
-    job: app_commands.Choice[str],
-    hours: app_commands.Choice[int],
-):
-    if interaction.guild_id is None:
-        await interaction.response.send_message(
-            "Use this command inside the server.",
-            ephemeral=False,
-        )
-        return
+async def run_job_for_character(
+    *,
+    guild_id: int,
+    user_id: int,
+    slot: str,
+    job_name: str,
+    hours: int,
+) -> tuple[discord.Embed | None, str | None]:
+    """
+    Shared job engine used by both /job and the Job Board.
 
-    await interaction.response.defer(
-        ephemeral=False,
-        thinking=True,
-    )
-
-    ability_name = JOB_ABILITIES[job.value]
+    Returns:
+        (embed, None) on success
+        (None, error_message) on failure
+    """
+    ability_name = JOB_ABILITIES[job_name]
 
     async with db().acquire() as connection:
         async with connection.transaction():
@@ -2279,46 +2270,43 @@ async def job_command(
                 AND slot=$3
                 FOR UPDATE
                 """,
-                interaction.guild_id,
-                interaction.user.id,
-                slot.value,
+                guild_id,
+                user_id,
+                slot,
             )
 
             if not row:
-                await interaction.followup.send(
+                return (
+                    None,
                     (
-                        f"You do not have a {slot.value} character yet. "
+                        f"You do not have a {slot} character yet. "
                         "Use `/character create` first."
                     ),
-                    ephemeral=False,
                 )
-                return
 
             current_downtime = int(row["downtime_hours"])
 
-            if current_downtime < hours.value:
-                await interaction.followup.send(
+            if current_downtime < hours:
+                return (
+                    None,
                     (
                         f"You only have **{current_downtime}** downtime hours "
-                        f"on your {slot.value} character, but this job needs "
-                        f"**{hours.value}**."
+                        f"on your {slot} character, but this job needs "
+                        f"**{hours}**."
                     ),
-                    ephemeral=False,
                 )
-                return
 
             stats = dict(row["stats"])
 
             if ability_name not in stats:
-                await interaction.followup.send(
+                return (
+                    None,
                     (
-                        f"Your {slot.value} character does not have an imported "
+                        f"Your {slot} character does not have an imported "
                         f"**{ability_name}** score yet. Import the character sheet "
                         "before using this job."
                     ),
-                    ephemeral=False,
                 )
-                return
 
             ability_score = int(stats[ability_name])
             modifier = ability_modifier(ability_score)
@@ -2328,7 +2316,7 @@ async def job_command(
             rank = rank_for_level(server_level)
             gold_per_success = JOB_RANK_PAY[rank]
 
-            roll_count = hours.value // 8
+            roll_count = hours // 8
             roll_results = []
             total_gold = 0
 
@@ -2357,7 +2345,7 @@ async def job_command(
                     )
                 )
 
-            new_downtime = current_downtime - hours.value
+            new_downtime = current_downtime - hours
             new_gold = int(row["gold"]) + total_gold
 
             await connection.execute(
@@ -2376,10 +2364,12 @@ async def job_command(
                 new_downtime,
                 server_level,
                 rank,
-                interaction.guild_id,
-                interaction.user.id,
-                slot.value,
+                guild_id,
+                user_id,
+                slot,
             )
+
+            character_name = str(row["character_name"])
 
     roll_lines = []
 
@@ -2411,10 +2401,10 @@ async def job_command(
         )
 
     embed = discord.Embed(
-        title=f"💼 {job.value} ({ability_name}) Work",
+        title=f"💼 {job_name} ({ability_name}) Work",
         description=(
-            f"**{row['character_name']}** worked as a "
-            f"**{job.value} ({ability_name})**."
+            f"**{character_name}** worked as a "
+            f"**{job_name} ({ability_name})**."
         ),
         color=discord.Color.gold(),
     )
@@ -2439,7 +2429,7 @@ async def job_command(
     embed.add_field(
         name="Results",
         value=(
-            f"**Downtime spent:** {hours.value} hours\n"
+            f"**Downtime spent:** {hours} hours\n"
             f"**Downtime remaining:** {new_downtime} / 40\n"
             f"**Gold earned:** {total_gold}\n"
             f"**New gold total:** {new_gold}"
@@ -2447,8 +2437,355 @@ async def job_command(
         inline=False,
     )
 
+    return embed, None
+
+
+@bot.tree.command(
+    name="job",
+    description="Spend downtime working a job to earn gold",
+)
+@app_commands.choices(
+    slot=SLOTS,
+    job=JOB_CHOICES,
+    hours=DOWNTIME_CHOICES,
+)
+async def job_command(
+    interaction: discord.Interaction,
+    slot: app_commands.Choice[str],
+    job: app_commands.Choice[str],
+    hours: app_commands.Choice[int],
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=False,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=False,
+        thinking=True,
+    )
+
+    embed, error = await run_job_for_character(
+        guild_id=interaction.guild_id,
+        user_id=interaction.user.id,
+        slot=slot.value,
+        job_name=job.value,
+        hours=hours.value,
+    )
+
+    if error:
+        await interaction.followup.send(
+            error,
+            ephemeral=False,
+        )
+        return
+
     await interaction.followup.send(
         embed=embed,
+        ephemeral=False,
+    )
+
+
+class JobSessionView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.selected_slot: str | None = None
+        self.selected_job: str | None = None
+        self.selected_hours: int | None = None
+        self.processed = False
+
+        self.slot_select = discord.ui.Select(
+            placeholder="Choose Main or Alt",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Main",
+                    value="Main",
+                ),
+                discord.SelectOption(
+                    label="Alt",
+                    value="Alt",
+                ),
+            ],
+            row=0,
+        )
+
+        self.job_select = discord.ui.Select(
+            placeholder="Choose a job",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Soldier (Strength)",
+                    value="Soldier",
+                ),
+                discord.SelectOption(
+                    label="Thief (Dexterity)",
+                    value="Thief",
+                ),
+                discord.SelectOption(
+                    label="Farmer (Constitution)",
+                    value="Farmer",
+                ),
+                discord.SelectOption(
+                    label="Teacher (Intelligence)",
+                    value="Teacher",
+                ),
+                discord.SelectOption(
+                    label="Priest (Wisdom)",
+                    value="Priest",
+                ),
+                discord.SelectOption(
+                    label="Performer (Charisma)",
+                    value="Performer",
+                ),
+            ],
+            row=1,
+        )
+
+        self.hours_select = discord.ui.Select(
+            placeholder="Choose downtime hours",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(label="8 hours", value="8"),
+                discord.SelectOption(label="16 hours", value="16"),
+                discord.SelectOption(label="24 hours", value="24"),
+                discord.SelectOption(label="32 hours", value="32"),
+                discord.SelectOption(label="40 hours", value="40"),
+            ],
+            row=2,
+        )
+
+        self.work_button = discord.ui.Button(
+            label="Work Job",
+            emoji="💼",
+            style=discord.ButtonStyle.success,
+            row=3,
+        )
+
+        self.cancel_button = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.secondary,
+            row=3,
+        )
+
+        self.slot_select.callback = self.slot_changed
+        self.job_select.callback = self.job_changed
+        self.hours_select.callback = self.hours_changed
+        self.work_button.callback = self.work_job
+        self.cancel_button.callback = self.cancel
+
+        self.add_item(self.slot_select)
+        self.add_item(self.job_select)
+        self.add_item(self.hours_select)
+        self.add_item(self.work_button)
+        self.add_item(self.cancel_button)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if (
+            interaction.user.id == self.user_id
+            and interaction.guild_id == self.guild_id
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "This private job session belongs to another player.",
+            ephemeral=True,
+        )
+        return False
+
+    async def slot_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_slot = self.slot_select.values[0]
+        await interaction.response.defer()
+
+    async def job_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_job = self.job_select.values[0]
+        await interaction.response.defer()
+
+    async def hours_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_hours = int(
+            self.hours_select.values[0]
+        )
+        await interaction.response.defer()
+
+    async def work_job(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if self.processed:
+            await interaction.response.send_message(
+                "This job session has already been processed.",
+                ephemeral=True,
+            )
+            return
+
+        if self.selected_slot is None:
+            await interaction.response.send_message(
+                "Choose Main or Alt first.",
+                ephemeral=True,
+            )
+            return
+
+        if self.selected_job is None:
+            await interaction.response.send_message(
+                "Choose a job first.",
+                ephemeral=True,
+            )
+            return
+
+        if self.selected_hours is None:
+            await interaction.response.send_message(
+                "Choose how many downtime hours to spend first.",
+                ephemeral=True,
+            )
+            return
+
+        self.processed = True
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        embed, error = await run_job_for_character(
+            guild_id=self.guild_id,
+            user_id=self.user_id,
+            slot=self.selected_slot,
+            job_name=self.selected_job,
+            hours=self.selected_hours,
+        )
+
+        if error:
+            self.processed = False
+            await interaction.edit_original_response(
+                content=error,
+                embed=None,
+                view=self,
+            )
+            return
+
+        await interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            view=None,
+        )
+
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.processed = True
+        await interaction.response.edit_message(
+            content="Job session cancelled.",
+            embed=None,
+            view=None,
+        )
+
+
+class JobBoardView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Work a Job",
+        emoji="💼",
+        style=discord.ButtonStyle.primary,
+        custom_id="astrelius:jobboard:work",
+    )
+    async def work_a_job(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Use this inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="💼 Work a Job",
+            description=(
+                "Choose your character slot, job, and how many "
+                "downtime hours you want to spend."
+            ),
+            color=discord.Color.gold(),
+        )
+
+        embed.set_footer(
+            text="Only you can see and use this job session."
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=JobSessionView(
+                user_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+            ),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="jobboard",
+    description="Post the persistent Astrelius Job Board",
+)
+@app_commands.check(
+    staff_check
+)
+async def jobboard_command(
+    interaction: discord.Interaction,
+):
+    embed = discord.Embed(
+        title="💼 Astrelius Job Board",
+        description=(
+            "Earn gold by spending downtime.\n\n"
+            "Press **Work a Job** to open your private job menu."
+        ),
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="How it works",
+        value=(
+            "Choose your **Main or Alt**, select a job, "
+            "then choose **8, 16, 24, 32, or 40** downtime hours."
+        ),
+        inline=False,
+    )
+
+    embed.set_footer(
+        text="The Job Board stays public. Your job session and results stay private."
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=JobBoardView(),
         ephemeral=False,
     )
 
