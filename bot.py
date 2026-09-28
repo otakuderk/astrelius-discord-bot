@@ -44,6 +44,13 @@ DOWNTIME_CHOICES = [
     app_commands.Choice(name="40", value=40),
 ]
 
+
+QUEST_REWARD_MP_CHOICES = [
+    app_commands.Choice(name="1 MP", value=1),
+    app_commands.Choice(name="2 MP", value=2),
+    app_commands.Choice(name="3 MP", value=3),
+]
+
 LEVEL_THRESHOLDS = {
     1: 0,
     2: 2,
@@ -2148,6 +2155,980 @@ async def materials_remove(
 
     await finish_staff_change_silently(
         interaction
+    )
+
+
+
+# =========================================================
+# QUEST REWARDS
+# =========================================================
+
+@dataclass
+class QuestRewardRecipient:
+    user_id: int
+    display_name: str
+    slot: str
+
+
+class QuestRewardSession:
+    def __init__(
+        self,
+        guild: discord.Guild,
+        staff_user_id: int,
+        mp_reward: int,
+        gold_reward: int,
+    ) -> None:
+        self.guild = guild
+        self.staff_user_id = staff_user_id
+        self.mp_reward = mp_reward
+        self.gold_reward = gold_reward
+        self.recipients: list[
+            QuestRewardRecipient
+        ] = []
+        self.panel_message = None
+        self.finished = False
+
+    def can_use(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        return (
+            interaction.user.id
+            == self.staff_user_id
+            and interaction.guild_id
+            == self.guild.id
+        )
+
+    def summary_embed(
+        self,
+        confirmation: bool = False,
+    ) -> discord.Embed:
+        title = (
+            "Confirm Quest Rewards"
+            if confirmation
+            else "Quest Rewards"
+        )
+
+        embed = discord.Embed(
+            title=title,
+            color=discord.Color.gold(),
+        )
+
+        embed.add_field(
+            name="Rewards",
+            value=(
+                f"**MP:** +{self.mp_reward}\n"
+                f"**Gold:** +{self.gold_reward}\n"
+                "**Downtime:** Set to 40 / 40"
+            ),
+            inline=False,
+        )
+
+        if self.recipients:
+            lines = [
+                (
+                    f"{index}. "
+                    f"{recipient.display_name} "
+                    f"— {recipient.slot}"
+                )
+                for index, recipient
+                in enumerate(
+                    self.recipients,
+                    start=1,
+                )
+            ]
+
+            recipient_text = "\n".join(
+                lines
+            )
+
+            if len(recipient_text) > 1000:
+                recipient_text = (
+                    recipient_text[:995]
+                    + "..."
+                )
+
+        else:
+            recipient_text = (
+                "No players added yet."
+            )
+
+        embed.add_field(
+            name=(
+                f"Recipients "
+                f"({len(self.recipients)})"
+            ),
+            value=recipient_text,
+            inline=False,
+        )
+
+        if confirmation:
+            embed.set_footer(
+                text=(
+                    "Confirm to apply these rewards "
+                    "to every selected character."
+                )
+            )
+
+        else:
+            embed.set_footer(
+                text=(
+                    "Add players one at a time. "
+                    "Each player can use Main or Alt."
+                )
+            )
+
+        return embed
+
+    async def refresh_panel(
+        self,
+    ) -> None:
+        if (
+            self.panel_message is None
+            or self.finished
+        ):
+            return
+
+        try:
+            await self.panel_message.edit(
+                embed=self.summary_embed(),
+                view=QuestRewardPanelView(
+                    self
+                ),
+            )
+
+        except (
+            discord.NotFound,
+            discord.HTTPException,
+        ):
+            pass
+
+    async def add_recipient(
+        self,
+        member: discord.Member,
+        slot: str,
+    ) -> tuple[bool, str]:
+        if self.finished:
+            return (
+                False,
+                "This reward session is already finished.",
+            )
+
+        for recipient in self.recipients:
+            if (
+                recipient.user_id
+                == member.id
+                and recipient.slot
+                == slot
+            ):
+                return (
+                    False,
+                    (
+                        f"{member.display_name} "
+                        f"({slot}) is already added."
+                    ),
+                )
+
+        self.recipients.append(
+            QuestRewardRecipient(
+                user_id=member.id,
+                display_name=(
+                    member.display_name
+                ),
+                slot=slot,
+            )
+        )
+
+        await self.refresh_panel()
+
+        return (
+            True,
+            (
+                f"Added **{member.display_name}** "
+                f"({slot})."
+            ),
+        )
+
+    async def remove_recipient(
+        self,
+        number: int,
+    ) -> tuple[bool, str]:
+        if self.finished:
+            return (
+                False,
+                "This reward session is already finished.",
+            )
+
+        if not (
+            1
+            <= number
+            <= len(
+                self.recipients
+            )
+        ):
+            return (
+                False,
+                (
+                    "That recipient number does not exist. "
+                    "Use the number shown on the reward panel."
+                ),
+            )
+
+        removed = self.recipients.pop(
+            number - 1
+        )
+
+        await self.refresh_panel()
+
+        return (
+            True,
+            (
+                f"Removed **{removed.display_name}** "
+                f"({removed.slot})."
+            ),
+        )
+
+    async def apply_rewards(
+        self,
+    ) -> tuple[
+        list[str],
+        list[str],
+        list[str],
+    ]:
+        applied: list[str] = []
+        skipped: list[str] = []
+        role_notes: list[str] = []
+
+        if self.finished:
+            return (
+                applied,
+                ["This reward session is already finished."],
+                role_notes,
+            )
+
+        self.finished = True
+
+        for recipient in list(
+            self.recipients
+        ):
+            member = self.guild.get_member(
+                recipient.user_id
+            )
+
+            if member is None:
+                skipped.append(
+                    (
+                        f"{recipient.display_name} "
+                        f"({recipient.slot}) "
+                        "is no longer in the server."
+                    )
+                )
+                continue
+
+            async with (
+                db().acquire()
+            ) as connection:
+                async with (
+                    connection.transaction()
+                ):
+                    row = (
+                        await connection.fetchrow(
+                            """
+                            SELECT *
+                            FROM characters
+                            WHERE guild_id=$1
+                            AND user_id=$2
+                            AND slot=$3
+                            FOR UPDATE
+                            """,
+                            self.guild.id,
+                            recipient.user_id,
+                            recipient.slot,
+                        )
+                    )
+
+                    if not row:
+                        skipped.append(
+                            (
+                                f"{member.display_name} "
+                                f"({recipient.slot}) "
+                                "does not have that character slot."
+                            )
+                        )
+                        continue
+
+                    current_mp = max(
+                        0,
+                        int(
+                            row["mp"]
+                        ),
+                    )
+
+                    current_gold = max(
+                        0,
+                        int(
+                            row["gold"]
+                        ),
+                    )
+
+                    new_mp = (
+                        current_mp
+                        + self.mp_reward
+                    )
+
+                    new_level = (
+                        level_for_mp(
+                            new_mp
+                        )
+                    )
+
+                    new_rank = (
+                        rank_for_level(
+                            new_level
+                        )
+                    )
+
+                    new_gold = (
+                        current_gold
+                        + self.gold_reward
+                    )
+
+                    await connection.execute(
+                        """
+                        UPDATE characters
+                        SET mp=$1,
+                            level=$2,
+                            rank=$3,
+                            gold=$4,
+                            downtime_hours=40,
+                            updated_at=now()
+                        WHERE guild_id=$5
+                        AND user_id=$6
+                        AND slot=$7
+                        """,
+                        new_mp,
+                        new_level,
+                        new_rank,
+                        new_gold,
+                        self.guild.id,
+                        recipient.user_id,
+                        recipient.slot,
+                    )
+
+            role_note = (
+                await sync_rank_role(
+                    member
+                )
+                or ""
+            )
+
+            if role_note:
+                role_notes.append(
+                    (
+                        f"{member.display_name}: "
+                        f"{role_note}"
+                    )
+                )
+
+            applied.append(
+                (
+                    f"{member.display_name} "
+                    f"({recipient.slot})"
+                )
+            )
+
+        return (
+            applied,
+            skipped,
+            role_notes,
+        )
+
+
+class QuestRewardRecipientPicker(
+    discord.ui.View,
+):
+    def __init__(
+        self,
+        session: QuestRewardSession,
+    ) -> None:
+        super().__init__(
+            timeout=300
+        )
+
+        self.session = session
+        self.selected_member: (
+            discord.Member | None
+        ) = None
+        self.selected_slot: (
+            str | None
+        ) = None
+
+        self.member_select = (
+            discord.ui.UserSelect(
+                placeholder="Choose a player",
+                min_values=1,
+                max_values=1,
+                row=0,
+            )
+        )
+
+        self.slot_select = discord.ui.Select(
+            placeholder="Choose Main or Alt",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Main",
+                    value="Main",
+                ),
+                discord.SelectOption(
+                    label="Alt",
+                    value="Alt",
+                ),
+            ],
+            row=1,
+        )
+
+        self.add_button = discord.ui.Button(
+            label="Add Player",
+            emoji="➕",
+            style=discord.ButtonStyle.success,
+            row=2,
+        )
+
+        self.cancel_button = discord.ui.Button(
+            label="Cancel",
+            style=discord.ButtonStyle.secondary,
+            row=2,
+        )
+
+        self.member_select.callback = (
+            self.member_changed
+        )
+
+        self.slot_select.callback = (
+            self.slot_changed
+        )
+
+        self.add_button.callback = (
+            self.add_selected
+        )
+
+        self.cancel_button.callback = (
+            self.cancel
+        )
+
+        self.add_item(
+            self.member_select
+        )
+
+        self.add_item(
+            self.slot_select
+        )
+
+        self.add_item(
+            self.add_button
+        )
+
+        self.add_item(
+            self.cancel_button
+        )
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if self.session.can_use(
+            interaction
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "Only the staff member who opened this reward panel can use it.",
+            ephemeral=True,
+        )
+
+        return False
+
+    async def member_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        selected = (
+            self.member_select.values[0]
+        )
+
+        if isinstance(
+            selected,
+            discord.Member,
+        ):
+            self.selected_member = (
+                selected
+            )
+
+        else:
+            member = (
+                interaction.guild.get_member(
+                    selected.id
+                )
+                if interaction.guild
+                else None
+            )
+
+            self.selected_member = (
+                member
+            )
+
+        await interaction.response.defer()
+
+    async def slot_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_slot = (
+            self.slot_select.values[0]
+        )
+
+        await interaction.response.defer()
+
+    async def add_selected(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if self.selected_member is None:
+            await interaction.response.send_message(
+                "Choose a player first.",
+                ephemeral=True,
+            )
+            return
+
+        if self.selected_slot is None:
+            await interaction.response.send_message(
+                "Choose Main or Alt first.",
+                ephemeral=True,
+            )
+            return
+
+        success, message = (
+            await self.session.add_recipient(
+                self.selected_member,
+                self.selected_slot,
+            )
+        )
+
+        if success:
+            await interaction.response.edit_message(
+                content=message,
+                view=None,
+            )
+
+        else:
+            await interaction.response.send_message(
+                message,
+                ephemeral=True,
+            )
+
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Player selection cancelled.",
+            view=None,
+        )
+
+
+class QuestRewardRemoveModal(
+    discord.ui.Modal,
+    title="Remove Reward Recipient",
+):
+    recipient_number = discord.ui.TextInput(
+        label="Recipient number",
+        placeholder="Example: 2",
+        min_length=1,
+        max_length=8,
+    )
+
+    def __init__(
+        self,
+        session: QuestRewardSession,
+    ) -> None:
+        super().__init__()
+
+        self.session = session
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if not self.session.can_use(
+            interaction
+        ):
+            await interaction.response.send_message(
+                "Only the staff member who opened this reward panel can use it.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            number = int(
+                str(
+                    self.recipient_number
+                ).strip()
+            )
+
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter a whole recipient number.",
+                ephemeral=True,
+            )
+            return
+
+        success, message = (
+            await self.session.remove_recipient(
+                number
+            )
+        )
+
+        await interaction.response.send_message(
+            message,
+            ephemeral=True,
+        )
+
+
+class QuestRewardConfirmView(
+    discord.ui.View,
+):
+    def __init__(
+        self,
+        session: QuestRewardSession,
+    ) -> None:
+        super().__init__(
+            timeout=300
+        )
+
+        self.session = session
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if self.session.can_use(
+            interaction
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "Only the staff member who opened this reward panel can use it.",
+            ephemeral=True,
+        )
+
+        return False
+
+    @discord.ui.button(
+        label="Confirm",
+        emoji="✅",
+        style=discord.ButtonStyle.success,
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.session.finished:
+            await interaction.response.send_message(
+                "These rewards have already been processed.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        applied, skipped, role_notes = (
+            await self.session.apply_rewards()
+        )
+
+        if (
+            self.session.panel_message
+            is not None
+        ):
+            try:
+                finished_embed = (
+                    self.session.summary_embed()
+                )
+
+                finished_embed.title = (
+                    "Quest Rewards Complete"
+                )
+
+                finished_embed.set_footer(
+                    text=(
+                        "This reward batch has been processed."
+                    )
+                )
+
+                await (
+                    self.session
+                    .panel_message
+                    .edit(
+                        embed=finished_embed,
+                        view=None,
+                    )
+                )
+
+            except (
+                discord.NotFound,
+                discord.HTTPException,
+            ):
+                pass
+
+        lines = []
+
+        if applied:
+            lines.append(
+                (
+                    f"**Rewarded ({len(applied)}):**\n"
+                    + "\n".join(
+                        f"• {item}"
+                        for item in applied
+                    )
+                )
+            )
+
+        if skipped:
+            lines.append(
+                (
+                    f"**Skipped ({len(skipped)}):**\n"
+                    + "\n".join(
+                        f"• {item}"
+                        for item in skipped
+                    )
+                )
+            )
+
+        if role_notes:
+            lines.append(
+                (
+                    "**Rank role notes:**\n"
+                    + "\n".join(
+                        f"• {item}"
+                        for item in role_notes
+                    )
+                )
+            )
+
+        if not lines:
+            lines.append(
+                "No rewards were applied."
+            )
+
+        summary = "\n\n".join(
+            lines
+        )
+
+        if len(summary) > 1900:
+            summary = (
+                summary[:1895]
+                + "..."
+            )
+
+        await interaction.followup.send(
+            summary,
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        await interaction.response.edit_message(
+            content="Reward confirmation cancelled.",
+            embed=None,
+            view=None,
+        )
+
+
+class QuestRewardPanelView(
+    discord.ui.View,
+):
+    def __init__(
+        self,
+        session: QuestRewardSession,
+    ) -> None:
+        super().__init__(
+            timeout=900
+        )
+
+        self.session = session
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if self.session.can_use(
+            interaction
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "Only the staff member who opened this reward panel can use it.",
+            ephemeral=True,
+        )
+
+        return False
+
+    @discord.ui.button(
+        label="Add Player",
+        emoji="➕",
+        style=discord.ButtonStyle.success,
+    )
+    async def add_player(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if self.session.finished:
+            await interaction.response.send_message(
+                "This reward batch is already finished.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "Choose a player and whether to reward their Main or Alt character.",
+            view=QuestRewardRecipientPicker(
+                self.session
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Remove Player",
+        emoji="➖",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def remove_player(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if not self.session.recipients:
+            await interaction.response.send_message(
+                "There are no recipients to remove.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            QuestRewardRemoveModal(
+                self.session
+            )
+        )
+
+    @discord.ui.button(
+        label="Give Rewards",
+        emoji="🎁",
+        style=discord.ButtonStyle.primary,
+    )
+    async def give_rewards(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if not self.session.recipients:
+            await interaction.response.send_message(
+                "Add at least one player before giving rewards.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            embed=(
+                self.session
+                .summary_embed(
+                    confirmation=True
+                )
+            ),
+            view=QuestRewardConfirmView(
+                self.session
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.danger,
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        self.session.finished = True
+
+        await interaction.response.edit_message(
+            content="Quest reward batch cancelled.",
+            embed=None,
+            view=None,
+        )
+
+
+@bot.tree.command(
+    name="questreward",
+    description="Give quest rewards to multiple characters",
+)
+@app_commands.choices(
+    mp=QUEST_REWARD_MP_CHOICES
+)
+@app_commands.check(
+    staff_check
+)
+async def questreward(
+    interaction: discord.Interaction,
+    mp: app_commands.Choice[int],
+    gold: app_commands.Range[
+        int,
+        0,
+        1_000_000,
+    ],
+):
+    if (
+        interaction.guild
+        is None
+    ):
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    session = QuestRewardSession(
+        guild=interaction.guild,
+        staff_user_id=(
+            interaction.user.id
+        ),
+        mp_reward=mp.value,
+        gold_reward=gold,
+    )
+
+    await interaction.response.send_message(
+        embed=session.summary_embed(),
+        view=QuestRewardPanelView(
+            session
+        ),
+        ephemeral=True,
+    )
+
+    session.panel_message = (
+        await interaction.original_response()
     )
 
 
