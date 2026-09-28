@@ -6719,6 +6719,232 @@ async def auction_command(
 
 
 
+
+# =========================================================
+# PLAYER GOLD TRANSFERS
+# =========================================================
+
+@bot.tree.command(
+    name="pay",
+    description="Pay another player's character gold",
+)
+@app_commands.choices(
+    slot=SLOTS,
+    recipient_slot=SLOTS,
+)
+@app_commands.describe(
+    slot="Your character paying the gold",
+    recipient="Player receiving the gold",
+    recipient_slot="Their character receiving the gold",
+    amount="Amount of gold to pay",
+    reason="Why you are paying them",
+)
+async def pay_command(
+    interaction: discord.Interaction,
+    slot: app_commands.Choice[str],
+    recipient: discord.Member,
+    recipient_slot: app_commands.Choice[str],
+    amount: app_commands.Range[int, 1, 1_000_000_000],
+    reason: app_commands.Range[str, 1, 300],
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=False,
+        )
+        return
+
+    if recipient.id == interaction.user.id:
+        await interaction.response.send_message(
+            "You cannot use `/pay` to pay yourself.",
+            ephemeral=False,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=False,
+        thinking=True,
+    )
+
+    sender_slot = slot.value
+    receiver_slot = recipient_slot.value
+
+    async with db().acquire() as connection:
+        async with connection.transaction():
+            # Lock both character rows in a consistent order so two
+            # simultaneous payments cannot race each other.
+            character_keys = sorted(
+                [
+                    (interaction.user.id, sender_slot),
+                    (recipient.id, receiver_slot),
+                ],
+                key=lambda value: (value[0], value[1]),
+            )
+
+            locked_rows = {}
+
+            for user_id, character_slot in character_keys:
+                row = await connection.fetchrow(
+                    """
+                    SELECT *
+                    FROM characters
+                    WHERE guild_id=$1
+                    AND user_id=$2
+                    AND slot=$3
+                    FOR UPDATE
+                    """,
+                    interaction.guild_id,
+                    user_id,
+                    character_slot,
+                )
+
+                if row:
+                    locked_rows[
+                        (user_id, character_slot)
+                    ] = row
+
+            sender = locked_rows.get(
+                (
+                    interaction.user.id,
+                    sender_slot,
+                )
+            )
+
+            if not sender:
+                await interaction.followup.send(
+                    (
+                        f"You do not have a "
+                        f"**{sender_slot}** character yet."
+                    ),
+                    ephemeral=False,
+                )
+                return
+
+            receiver = locked_rows.get(
+                (
+                    recipient.id,
+                    receiver_slot,
+                )
+            )
+
+            if not receiver:
+                await interaction.followup.send(
+                    (
+                        f"{recipient.mention} does not have a "
+                        f"**{receiver_slot}** character yet."
+                    ),
+                    ephemeral=False,
+                )
+                return
+
+            _, reserved_gold, available_gold = (
+                await available_gold_for_character(
+                    connection,
+                    guild_id=interaction.guild_id,
+                    user_id=interaction.user.id,
+                    slot=sender_slot,
+                    lock=False,
+                )
+            )
+
+            if available_gold < amount:
+                await interaction.followup.send(
+                    (
+                        f"You only have **{available_gold} Gold available** "
+                        f"to spend. "
+                        f"**{reserved_gold} Gold** is currently committed "
+                        "to active auction bids."
+                    ),
+                    ephemeral=False,
+                )
+                return
+
+            new_sender_gold = (
+                int(sender["gold"]) - amount
+            )
+
+            new_receiver_gold = (
+                int(receiver["gold"]) + amount
+            )
+
+            await connection.execute(
+                """
+                UPDATE characters
+                SET gold=$1,
+                    updated_at=now()
+                WHERE guild_id=$2
+                AND user_id=$3
+                AND slot=$4
+                """,
+                new_sender_gold,
+                interaction.guild_id,
+                interaction.user.id,
+                sender_slot,
+            )
+
+            await connection.execute(
+                """
+                UPDATE characters
+                SET gold=$1,
+                    updated_at=now()
+                WHERE guild_id=$2
+                AND user_id=$3
+                AND slot=$4
+                """,
+                new_receiver_gold,
+                interaction.guild_id,
+                recipient.id,
+                receiver_slot,
+            )
+
+            sender_name = str(
+                sender["character_name"]
+            )
+
+            receiver_name = str(
+                receiver["character_name"]
+            )
+
+    embed = discord.Embed(
+        title="💰 Gold Payment",
+        description=(
+            f"{interaction.user.mention} paid "
+            f"{recipient.mention} **{amount} Gold**."
+        ),
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="From",
+        value=(
+            f"**{sender_name}** "
+            f"({sender_slot})"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="To",
+        value=(
+            f"**{receiver_name}** "
+            f"({receiver_slot})"
+        ),
+        inline=True,
+    )
+
+    embed.add_field(
+        name="Reason",
+        value=reason.strip(),
+        inline=False,
+    )
+
+    await interaction.followup.send(
+        embed=embed,
+        ephemeral=False,
+    )
+
+
+
 # =========================================================
 # REGISTER GROUPS
 # =========================================================
