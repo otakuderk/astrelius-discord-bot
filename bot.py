@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import secrets
 from dataclasses import dataclass
 from typing import Literal
 
@@ -50,6 +51,37 @@ QUEST_REWARD_MP_CHOICES = [
     app_commands.Choice(name="2 MP", value=2),
     app_commands.Choice(name="3 MP", value=3),
 ]
+
+
+JOB_CHOICES = [
+    app_commands.Choice(name="Soldier", value="Soldier"),
+    app_commands.Choice(name="Thief", value="Thief"),
+    app_commands.Choice(name="Farmer", value="Farmer"),
+    app_commands.Choice(name="Teacher", value="Teacher"),
+    app_commands.Choice(name="Priest", value="Priest"),
+    app_commands.Choice(name="Performer", value="Performer"),
+]
+
+JOB_ABILITIES = {
+    "Soldier": "Strength",
+    "Thief": "Dexterity",
+    "Farmer": "Constitution",
+    "Teacher": "Intelligence",
+    "Priest": "Wisdom",
+    "Performer": "Charisma",
+}
+
+JOB_RANK_PAY = {
+    "F": 25,
+    "E": 50,
+    "D": 100,
+    "C": 250,
+    "B": 400,
+    "A": 600,
+    "S": 1000,
+}
+
+JOB_DC = 16
 
 LEVEL_THRESHOLDS = {
     1: 0,
@@ -2157,6 +2189,225 @@ async def materials_remove(
         interaction
     )
 
+
+
+
+# =========================================================
+# DOWNTIME JOBS
+# =========================================================
+
+@bot.tree.command(
+    name="job",
+    description="Spend downtime working a job to earn gold",
+)
+@app_commands.choices(
+    slot=SLOTS,
+    job=JOB_CHOICES,
+    hours=DOWNTIME_CHOICES,
+)
+async def job_command(
+    interaction: discord.Interaction,
+    slot: app_commands.Choice[str],
+    job: app_commands.Choice[str],
+    hours: app_commands.Choice[int],
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    ability_name = JOB_ABILITIES[job.value]
+
+    async with db().acquire() as connection:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                """
+                SELECT *
+                FROM characters
+                WHERE guild_id=$1
+                AND user_id=$2
+                AND slot=$3
+                FOR UPDATE
+                """,
+                interaction.guild_id,
+                interaction.user.id,
+                slot.value,
+            )
+
+            if not row:
+                await interaction.followup.send(
+                    (
+                        f"You do not have a {slot.value} character yet. "
+                        "Use `/character create` first."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            current_downtime = int(row["downtime_hours"])
+
+            if current_downtime < hours.value:
+                await interaction.followup.send(
+                    (
+                        f"You only have **{current_downtime}** downtime hours "
+                        f"on your {slot.value} character, but this job needs "
+                        f"**{hours.value}**."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            stats = dict(row["stats"])
+
+            if ability_name not in stats:
+                await interaction.followup.send(
+                    (
+                        f"Your {slot.value} character does not have an imported "
+                        f"**{ability_name}** score yet. Import the character sheet "
+                        "before using this job."
+                    ),
+                    ephemeral=True,
+                )
+                return
+
+            ability_score = int(stats[ability_name])
+            modifier = ability_modifier(ability_score)
+
+            server_mp = max(0, int(row["mp"]))
+            server_level = level_for_mp(server_mp)
+            rank = rank_for_level(server_level)
+            gold_per_success = JOB_RANK_PAY[rank]
+
+            roll_count = hours.value // 8
+            roll_results = []
+            total_gold = 0
+
+            for _ in range(roll_count):
+                natural_roll = secrets.randbelow(20) + 1
+                total_roll = natural_roll + modifier
+                natural_twenty = natural_roll == 20
+                success = total_roll >= JOB_DC
+
+                payout = 0
+                if success:
+                    payout = (
+                        gold_per_success * 2
+                        if natural_twenty
+                        else gold_per_success
+                    )
+
+                total_gold += payout
+                roll_results.append(
+                    (
+                        natural_roll,
+                        total_roll,
+                        success,
+                        natural_twenty,
+                        payout,
+                    )
+                )
+
+            new_downtime = current_downtime - hours.value
+            new_gold = int(row["gold"]) + total_gold
+
+            await connection.execute(
+                """
+                UPDATE characters
+                SET gold=$1,
+                    downtime_hours=$2,
+                    level=$3,
+                    rank=$4,
+                    updated_at=now()
+                WHERE guild_id=$5
+                AND user_id=$6
+                AND slot=$7
+                """,
+                new_gold,
+                new_downtime,
+                server_level,
+                rank,
+                interaction.guild_id,
+                interaction.user.id,
+                slot.value,
+            )
+
+    roll_lines = []
+
+    for index, (
+        natural_roll,
+        total_roll,
+        success,
+        natural_twenty,
+        payout,
+    ) in enumerate(roll_results, start=1):
+        if natural_twenty and success:
+            result_text = (
+                f"🌟 **NAT 20** → {total_roll} • "
+                f"Success • **{payout} Gold**"
+            )
+        elif success:
+            result_text = (
+                f"✅ {natural_roll} {modifier:+d} = {total_roll} • "
+                f"Success • **{payout} Gold**"
+            )
+        else:
+            result_text = (
+                f"❌ {natural_roll} {modifier:+d} = {total_roll} • "
+                "Failed • **0 Gold**"
+            )
+
+        roll_lines.append(
+            f"**Roll {index}:** {result_text}"
+        )
+
+    embed = discord.Embed(
+        title=f"💼 {job.value} Work",
+        description=(
+            f"**{row['character_name']}** worked as a "
+            f"**{job.value}**."
+        ),
+        color=discord.Color.gold(),
+    )
+
+    embed.add_field(
+        name="Job Check",
+        value=(
+            f"**Ability:** {ability_name} {ability_score} ({modifier:+d})\n"
+            f"**DC:** {JOB_DC}\n"
+            f"**Rank:** {rank}\n"
+            f"**Pay per success:** {gold_per_success} Gold"
+        ),
+        inline=False,
+    )
+
+    embed.add_field(
+        name=f"Work Rolls ({roll_count})",
+        value="\n".join(roll_lines),
+        inline=False,
+    )
+
+    embed.add_field(
+        name="Results",
+        value=(
+            f"**Downtime spent:** {hours.value} hours\n"
+            f"**Downtime remaining:** {new_downtime} / 40\n"
+            f"**Gold earned:** {total_gold}\n"
+            f"**New gold total:** {new_gold}"
+        ),
+        inline=False,
+    )
+
+    await interaction.followup.send(
+        embed=embed,
+        ephemeral=True,
+    )
 
 
 # =========================================================
