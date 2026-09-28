@@ -2177,11 +2177,13 @@ class QuestRewardSession:
         staff_user_id: int,
         mp_reward: int,
         gold_reward: int,
+        downtime_reward: int,
     ) -> None:
         self.guild = guild
         self.staff_user_id = staff_user_id
         self.mp_reward = mp_reward
         self.gold_reward = gold_reward
+        self.downtime_reward = downtime_reward
         self.recipients: list[
             QuestRewardRecipient
         ] = []
@@ -2219,7 +2221,7 @@ class QuestRewardSession:
             value=(
                 f"**MP:** +{self.mp_reward}\n"
                 f"**Gold:** +{self.gold_reward}\n"
-                "**Downtime:** Set to 40 / 40"
+                f"**Downtime:** Set to {self.downtime_reward} / 40"
             ),
             inline=False,
         )
@@ -2500,16 +2502,17 @@ class QuestRewardSession:
                             level=$2,
                             rank=$3,
                             gold=$4,
-                            downtime_hours=40,
+                            downtime_hours=$5,
                             updated_at=now()
-                        WHERE guild_id=$5
-                        AND user_id=$6
-                        AND slot=$7
+                        WHERE guild_id=$6
+                        AND user_id=$7
+                        AND slot=$8
                         """,
                         new_mp,
                         new_level,
                         new_rank,
                         new_gold,
+                        self.downtime_reward,
                         self.guild.id,
                         recipient.user_id,
                         recipient.slot,
@@ -3083,16 +3086,21 @@ class QuestRewardPanelView(
 
 @bot.tree.command(
     name="questreward",
-    description="Give quest rewards to multiple characters",
+    description="Give quest rewards to one or more characters",
 )
 @app_commands.choices(
-    mp=QUEST_REWARD_MP_CHOICES
+    downtime=DOWNTIME_CHOICES,
+    mp=QUEST_REWARD_MP_CHOICES,
+    slot=SLOTS,
 )
 @app_commands.check(
     staff_check
 )
 async def questreward(
     interaction: discord.Interaction,
+    player: discord.Member,
+    slot: app_commands.Choice[str],
+    downtime: app_commands.Choice[int],
     mp: app_commands.Choice[int],
     gold: app_commands.Range[
         int,
@@ -3100,10 +3108,7 @@ async def questreward(
         1_000_000,
     ],
 ):
-    if (
-        interaction.guild
-        is None
-    ):
+    if interaction.guild is None:
         await interaction.response.send_message(
             "Use this command inside the server.",
             ephemeral=True,
@@ -3112,18 +3117,23 @@ async def questreward(
 
     session = QuestRewardSession(
         guild=interaction.guild,
-        staff_user_id=(
-            interaction.user.id
-        ),
+        staff_user_id=interaction.user.id,
         mp_reward=mp.value,
         gold_reward=gold,
+        downtime_reward=downtime.value,
+    )
+
+    session.recipients.append(
+        QuestRewardRecipient(
+            user_id=player.id,
+            display_name=player.display_name,
+            slot=slot.value,
+        )
     )
 
     await interaction.response.send_message(
         embed=session.summary_embed(),
-        view=QuestRewardPanelView(
-            session
-        ),
+        view=QuestRewardPanelView(session),
         ephemeral=True,
     )
 
