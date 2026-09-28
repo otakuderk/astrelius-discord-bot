@@ -1737,9 +1737,21 @@ class InventorySessionView(discord.ui.View):
             )
             return
 
-        await interaction.edit_original_response(
-            content=None,
+        if interaction.channel is None:
+            await interaction.edit_original_response(
+                content="I could not post the inventory in this channel.",
+                embed=None,
+                view=None,
+            )
+            return
+
+        await interaction.channel.send(
             embed=embed,
+        )
+
+        await interaction.edit_original_response(
+            content="Inventory posted.",
+            embed=None,
             view=None,
         )
 
@@ -1897,43 +1909,40 @@ async def downtime_set(
 # SHEET IMPORT
 # =========================================================
 
-@sheet.command(
-    name="import",
-    description=(
-        "Import a D&D Beyond PDF "
-        "or character-sheet image"
-    ),
-)
-@app_commands.choices(
-    slot=SLOTS
-)
-async def sheet_import(
-    interaction: discord.Interaction,
-    slot: app_commands.Choice[str],
+async def import_character_sheet(
+    *,
+    guild_id: int,
+    user_id: int,
+    slot: str,
     file: discord.Attachment,
-):
-    await interaction.response.defer(
-        ephemeral=False,
-        thinking=True,
-    )
-
+) -> tuple[bool, str]:
     if file.size > 12_000_000:
-        await interaction.followup.send(
+        return (
+            False,
             "Please upload a file smaller than 12 MB.",
-            ephemeral=False,
         )
 
-        return
-
-    existing = await get_character(
-        interaction,
-        interaction.user,
-        slot.value,
-        ephemeral=False,
+    existing = await db().fetchrow(
+        """
+        SELECT *
+        FROM characters
+        WHERE guild_id=$1
+        AND user_id=$2
+        AND slot=$3
+        """,
+        guild_id,
+        user_id,
+        slot,
     )
 
     if not existing:
-        return
+        return (
+            False,
+            (
+                f"You do not have a {slot} character yet. "
+                "Create that character first."
+            ),
+        )
 
     try:
         parsed = extract_sheet(
@@ -1947,12 +1956,10 @@ async def sheet_import(
             exc,
         )
 
-        await interaction.followup.send(
+        return (
+            False,
             f"I couldn't read that sheet: {exc}",
-            ephemeral=False,
         )
-
-        return
 
     if (
         not parsed.stats
@@ -1961,26 +1968,16 @@ async def sheet_import(
         and not parsed.class_name
         and not parsed.subclass_name
     ):
-        await interaction.followup.send(
+        return (
+            False,
             (
                 "I could not recognize character details. "
                 "Try the exported D&D Beyond PDF."
             ),
-            ephemeral=False,
         )
 
-        return
-
-    # D&D Beyond never changes:
-    #
-    # MP
-    # Level
-    # Rank
-    # Gold
-    # Materials
-    # Downtime
-    #
-    # It only updates sheet-derived details.
+    # D&D Beyond imports only sheet-derived information.
+    # Server progression and economy values are preserved.
     await db().execute(
         """
         UPDATE characters
@@ -1996,35 +1993,69 @@ async def sheet_import(
         """,
         (
             parsed.name
-            or existing[
-                "character_name"
-            ]
+            or existing["character_name"]
         ),
         (
             parsed.class_name
-            or existing[
-                "class_name"
-            ]
+            or existing["class_name"]
         ),
         (
             parsed.subclass_name
-            or existing[
-                "subclass_name"
-            ]
+            or existing["subclass_name"]
         ),
         parsed.stats,
         parsed.proficiencies,
-        interaction.guild_id,
-        interaction.user.id,
-        slot.value,
+        guild_id,
+        user_id,
+        slot,
     )
 
-    await interaction.followup.send(
+    return (
+        True,
         (
             "Sheet imported. "
             "Class, subclass, stats, and proficiencies updated. "
             "Server progression was preserved."
         ),
+    )
+
+
+@sheet.command(
+    name="import",
+    description=(
+        "Import a D&D Beyond PDF "
+        "or character-sheet image"
+    ),
+)
+@app_commands.choices(
+    slot=SLOTS
+)
+async def sheet_import(
+    interaction: discord.Interaction,
+    slot: app_commands.Choice[str],
+    file: discord.Attachment,
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=False,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=False,
+        thinking=True,
+    )
+
+    _, message = await import_character_sheet(
+        guild_id=interaction.guild_id,
+        user_id=interaction.user.id,
+        slot=slot.value,
+        file=file,
+    )
+
+    await interaction.followup.send(
+        message,
         ephemeral=False,
     )
 
@@ -2032,6 +2063,111 @@ async def sheet_import(
 # =========================================================
 # CHARACTER SHEET BOARD
 # =========================================================
+
+class SheetUploadModal(discord.ui.Modal):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+        slot: str,
+    ) -> None:
+        super().__init__(
+            title="Upload Character Sheet",
+            timeout=300,
+        )
+
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.slot = slot
+
+        file_upload_type = getattr(
+            discord.ui,
+            "FileUpload",
+            None,
+        )
+
+        label_type = getattr(
+            discord.ui,
+            "Label",
+            None,
+        )
+
+        if file_upload_type is None:
+            raise RuntimeError(
+                "Character-sheet file upload requires discord.py 2.7 or newer."
+            )
+
+        self.file_upload = file_upload_type(
+            custom_id="astrelius:sheetupload:file",
+            required=True,
+            min_values=1,
+            max_values=1,
+        )
+
+        if label_type is not None:
+            self.add_item(
+                label_type(
+                    text="D&D Beyond Sheet",
+                    description="Upload a PDF, PNG, JPG, or WebP file.",
+                    component=self.file_upload,
+                )
+            )
+        else:
+            self.add_item(
+                self.file_upload
+            )
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if (
+            interaction.user.id == self.user_id
+            and interaction.guild_id == self.guild_id
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "This sheet upload belongs to another player.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        values = list(
+            self.file_upload.values
+        )
+
+        if not values:
+            await interaction.response.send_message(
+                "Choose a file first.",
+                ephemeral=True,
+            )
+            return
+
+        attachment = values[0]
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        _, message = await import_character_sheet(
+            guild_id=self.guild_id,
+            user_id=self.user_id,
+            slot=self.slot,
+            file=attachment,
+        )
+
+        await interaction.followup.send(
+            message,
+            ephemeral=True,
+        )
+
 
 class SheetSessionView(discord.ui.View):
     def __init__(
@@ -2063,18 +2199,18 @@ class SheetSessionView(discord.ui.View):
             row=0,
         )
 
-        self.continue_button = discord.ui.Button(
-            label="Continue",
+        self.upload_button = discord.ui.Button(
+            label="Select File",
             emoji="📄",
             style=discord.ButtonStyle.success,
             row=1,
         )
 
         self.slot_select.callback = self.slot_changed
-        self.continue_button.callback = self.continue_upload
+        self.upload_button.callback = self.open_upload
 
         self.add_item(self.slot_select)
-        self.add_item(self.continue_button)
+        self.add_item(self.upload_button)
 
     async def interaction_check(
         self,
@@ -2099,7 +2235,7 @@ class SheetSessionView(discord.ui.View):
         self.selected_slot = self.slot_select.values[0]
         await interaction.response.defer()
 
-    async def continue_upload(
+    async def open_upload(
         self,
         interaction: discord.Interaction,
     ) -> None:
@@ -2110,13 +2246,36 @@ class SheetSessionView(discord.ui.View):
             )
             return
 
-        await interaction.response.edit_message(
-            content=(
-                f"Use `/sheet import`, choose **{self.selected_slot}**, "
-                "and attach your D&D Beyond PDF or character-sheet image."
-            ),
-            embed=None,
-            view=None,
+        if getattr(
+            discord.ui,
+            "FileUpload",
+            None,
+        ) is None:
+            await interaction.response.send_message(
+                (
+                    "This upload button requires **discord.py 2.7 or newer**. "
+                    "Update the discord.py version used by Railway, then redeploy."
+                ),
+                ephemeral=True,
+            )
+            return
+
+        try:
+            modal = SheetUploadModal(
+                user_id=self.user_id,
+                guild_id=self.guild_id,
+                slot=self.selected_slot,
+            )
+
+        except RuntimeError as exc:
+            await interaction.response.send_message(
+                str(exc),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            modal
         )
 
 
@@ -2144,7 +2303,7 @@ class SheetBoardView(discord.ui.View):
 
         embed = discord.Embed(
             title="📄 Character Sheet",
-            description="Choose the character you want to update.",
+            description="Choose your character, then select your sheet file.",
             color=discord.Color.gold(),
         )
 
@@ -4194,7 +4353,7 @@ async def trainingboard_command(
 ):
     embed = discord.Embed(
         title="📚 Astrelius Training",
-        description="Train languages, proficiencies, or feats.",
+        description="Train languages, proficiencies, or replace a feat.",
         color=discord.Color.gold(),
     )
 
