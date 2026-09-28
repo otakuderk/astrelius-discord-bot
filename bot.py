@@ -843,6 +843,9 @@ class DndBot(commands.Bot):
 
         # Re-register persistent UI views after every restart.
         self.add_view(JobBoardView())
+        self.add_view(TrainingBoardView())
+        self.add_view(InventoryBoardView())
+        self.add_view(SheetBoardView())
 
         await self.tree.sync()
 
@@ -1420,62 +1423,42 @@ async def character_delete(
 # INVENTORY
 # =========================================================
 
-@bot.tree.command(
-    name="inventory",
-    description="View your Main or Alt character inventory",
-)
-@app_commands.choices(
-    slot=SLOTS
-)
-async def inventory(
-    interaction: discord.Interaction,
-    slot: app_commands.Choice[str],
-):
-    await interaction.response.defer(
-        ephemeral=False
-    )
-
-    row = await get_character(
-        interaction,
-        interaction.user,
-        slot.value,
-        ephemeral=False,
+async def build_inventory_embed(
+    *,
+    guild_id: int,
+    member: discord.Member | discord.User,
+    slot: str,
+) -> tuple[discord.Embed | None, str | None]:
+    row = await db().fetchrow(
+        """
+        SELECT *
+        FROM characters
+        WHERE guild_id=$1
+        AND user_id=$2
+        AND slot=$3
+        """,
+        guild_id,
+        member.id,
+        slot,
     )
 
     if not row:
-        return
-
-    materials = dict(
-        row["materials"]
-    )
-
-    stats = dict(
-        row["stats"]
-    )
-
-    profs = list(
-        row["proficiencies"]
-    )
-
-    # MP controls exact server level.
-    server_mp = max(
-        0,
-        int(row["mp"]),
-    )
-
-    server_level = (
-        level_for_mp(
-            server_mp
+        return (
+            None,
+            (
+                f"You do not have a {slot} character yet. "
+                "Use `/character create` first."
+            ),
         )
-    )
 
-    calculated_rank = (
-        rank_for_level(
-            server_level
-        )
-    )
+    materials = dict(row["materials"])
+    stats = dict(row["stats"])
+    profs = list(row["proficiencies"])
 
-    # Fix older mismatched DB records.
+    server_mp = max(0, int(row["mp"]))
+    server_level = level_for_mp(server_mp)
+    calculated_rank = rank_for_level(server_level)
+
     if (
         int(row["level"]) != server_level
         or str(row["rank"]) != calculated_rank
@@ -1494,50 +1477,28 @@ async def inventory(
             server_level,
             calculated_rank,
             server_mp,
-            interaction.guild_id,
-            interaction.user.id,
-            slot.value,
+            guild_id,
+            member.id,
+            slot,
         )
 
-    # Rank displayed from actual Discord role.
     discord_rank = None
 
-    if isinstance(
-        interaction.user,
-        discord.Member,
-    ):
-        discord_rank = (
-            discord_rank_for_member(
-                interaction.user
-            )
-        )
+    if isinstance(member, discord.Member):
+        discord_rank = discord_rank_for_member(member)
 
-    display_rank = (
-        discord_rank
-        or calculated_rank
-    )
+    display_rank = discord_rank or calculated_rank
 
-    class_name = row[
-        "class_name"
-    ]
+    class_name = row["class_name"]
+    subclass_name = row["subclass_name"]
 
-    subclass_name = row[
-        "subclass_name"
-    ]
-
-    # Class and subclass are displayed
-    # on separate lines, Class first.
     class_lines: list[str] = []
 
     if class_name:
-        class_lines.append(
-            f"Class: {class_name}"
-        )
+        class_lines.append(f"Class: {class_name}")
 
     if subclass_name:
-        class_lines.append(
-            f"Subclass: {subclass_name}"
-        )
+        class_lines.append(f"Subclass: {subclass_name}")
 
     class_display = (
         "\n".join(class_lines)
@@ -1546,20 +1507,14 @@ async def inventory(
     )
 
     embed = discord.Embed(
-        title=(
-            f"{interaction.user.display_name} "
-            f"({slot.value})"
-        ),
+        title=f"{member.display_name} ({slot})",
         description=class_display,
         color=discord.Color.gold(),
     )
 
     embed.add_field(
         name="Level / Rank",
-        value=(
-            f"{server_level} / "
-            f"{display_rank}"
-        ),
+        value=f"{server_level} / {display_rank}",
     )
 
     embed.add_field(
@@ -1573,16 +1528,12 @@ async def inventory(
 
     embed.add_field(
         name="Gold",
-        value=str(
-            row["gold"]
-        ),
+        value=str(row["gold"]),
     )
 
     embed.add_field(
         name="Downtime Hours",
-        value=(
-            f"{row['downtime_hours']} / 40"
-        ),
+        value=f"{row['downtime_hours']} / 40",
     )
 
     stat_abbreviations = {
@@ -1598,17 +1549,8 @@ async def inventory(
 
     for stat_name in STAT_NAMES:
         if stat_name in stats:
-            score = int(
-                stats[
-                    stat_name
-                ]
-            )
-
-            modifier = (
-                ability_modifier(
-                    score
-                )
-            )
+            score = int(stats[stat_name])
+            modifier = ability_modifier(score)
 
             stat_lines.append(
                 (
@@ -1621,9 +1563,7 @@ async def inventory(
     embed.add_field(
         name="Stats",
         value=(
-            "\n".join(
-                stat_lines
-            )
+            "\n".join(stat_lines)
             or "Not imported"
         ),
         inline=False,
@@ -1649,21 +1589,218 @@ async def inventory(
                     f"{material}: "
                     f"{quantity}"
                 )
-                for (
-                    material,
-                    quantity,
-                )
-                in sorted(
-                    materials.items()
-                )
+                for material, quantity
+                in sorted(materials.items())
             )[:1024]
             or "None"
         ),
         inline=False,
     )
 
+    return embed, None
+
+
+@bot.tree.command(
+    name="inventory",
+    description="View your Main or Alt character inventory",
+)
+@app_commands.choices(
+    slot=SLOTS
+)
+async def inventory(
+    interaction: discord.Interaction,
+    slot: app_commands.Choice[str],
+):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=False,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=False
+    )
+
+    embed, error = await build_inventory_embed(
+        guild_id=interaction.guild_id,
+        member=interaction.user,
+        slot=slot.value,
+    )
+
+    if error:
+        await interaction.followup.send(
+            error,
+            ephemeral=False,
+        )
+        return
+
     await interaction.followup.send(
         embed=embed,
+        ephemeral=False,
+    )
+
+
+class InventorySessionView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.selected_slot: str | None = None
+
+        self.slot_select = discord.ui.Select(
+            placeholder="Choose Main or Alt",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Main",
+                    value="Main",
+                ),
+                discord.SelectOption(
+                    label="Alt",
+                    value="Alt",
+                ),
+            ],
+            row=0,
+        )
+
+        self.view_button = discord.ui.Button(
+            label="View Inventory",
+            emoji="🎒",
+            style=discord.ButtonStyle.success,
+            row=1,
+        )
+
+        self.slot_select.callback = self.slot_changed
+        self.view_button.callback = self.view_inventory
+
+        self.add_item(self.slot_select)
+        self.add_item(self.view_button)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if (
+            interaction.user.id == self.user_id
+            and interaction.guild_id == self.guild_id
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "This inventory menu belongs to another player.",
+            ephemeral=True,
+        )
+        return False
+
+    async def slot_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_slot = self.slot_select.values[0]
+        await interaction.response.defer()
+
+    async def view_inventory(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if self.selected_slot is None:
+            await interaction.response.send_message(
+                "Choose Main or Alt first.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        embed, error = await build_inventory_embed(
+            guild_id=self.guild_id,
+            member=interaction.user,
+            slot=self.selected_slot,
+        )
+
+        if error:
+            await interaction.edit_original_response(
+                content=error,
+                embed=None,
+                view=self,
+            )
+            return
+
+        await interaction.edit_original_response(
+            content=None,
+            embed=embed,
+            view=None,
+        )
+
+
+class InventoryBoardView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="View Inventory",
+        emoji="🎒",
+        style=discord.ButtonStyle.primary,
+        custom_id="astrelius:inventoryboard:view",
+    )
+    async def view_inventory(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Use this inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="🎒 Inventory",
+            description="Choose your character.",
+            color=discord.Color.gold(),
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=InventorySessionView(
+                user_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+            ),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="inventoryboard",
+    description="Post the Astrelius Inventory panel",
+)
+@app_commands.check(
+    staff_check
+)
+async def inventoryboard_command(
+    interaction: discord.Interaction,
+):
+    embed = discord.Embed(
+        title="🎒 Astrelius Inventory",
+        description="View your character information and resources.",
+        color=discord.Color.gold(),
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=InventoryBoardView(),
         ephemeral=False,
     )
 
@@ -1888,6 +2025,158 @@ async def sheet_import(
             "Class, subclass, stats, and proficiencies updated. "
             "Server progression was preserved."
         ),
+        ephemeral=False,
+    )
+
+
+# =========================================================
+# CHARACTER SHEET BOARD
+# =========================================================
+
+class SheetSessionView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.selected_slot: str | None = None
+
+        self.slot_select = discord.ui.Select(
+            placeholder="Choose Main or Alt",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Main",
+                    value="Main",
+                ),
+                discord.SelectOption(
+                    label="Alt",
+                    value="Alt",
+                ),
+            ],
+            row=0,
+        )
+
+        self.continue_button = discord.ui.Button(
+            label="Continue",
+            emoji="📄",
+            style=discord.ButtonStyle.success,
+            row=1,
+        )
+
+        self.slot_select.callback = self.slot_changed
+        self.continue_button.callback = self.continue_upload
+
+        self.add_item(self.slot_select)
+        self.add_item(self.continue_button)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if (
+            interaction.user.id == self.user_id
+            and interaction.guild_id == self.guild_id
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "This sheet menu belongs to another player.",
+            ephemeral=True,
+        )
+        return False
+
+    async def slot_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_slot = self.slot_select.values[0]
+        await interaction.response.defer()
+
+    async def continue_upload(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if self.selected_slot is None:
+            await interaction.response.send_message(
+                "Choose Main or Alt first.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.edit_message(
+            content=(
+                f"Use `/sheet import`, choose **{self.selected_slot}**, "
+                "and attach your D&D Beyond PDF or character-sheet image."
+            ),
+            embed=None,
+            view=None,
+        )
+
+
+class SheetBoardView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Upload Sheet",
+        emoji="📄",
+        style=discord.ButtonStyle.primary,
+        custom_id="astrelius:sheetboard:upload",
+    )
+    async def upload_sheet(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Use this inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="📄 Character Sheet",
+            description="Choose the character you want to update.",
+            color=discord.Color.gold(),
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=SheetSessionView(
+                user_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+            ),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="sheetboard",
+    description="Post the Astrelius Character Sheets panel",
+)
+@app_commands.check(
+    staff_check
+)
+async def sheetboard_command(
+    interaction: discord.Interaction,
+):
+    embed = discord.Embed(
+        title="📄 Astrelius Character Sheets",
+        description="Upload or update your D&D Beyond character sheet.",
+        color=discord.Color.gold(),
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=SheetBoardView(),
         ephemeral=False,
     )
 
@@ -2737,10 +3026,6 @@ class JobBoardView(discord.ui.View):
             color=discord.Color.gold(),
         )
 
-        embed.set_footer(
-            text="Only you can see and use this job session."
-        )
-
         await interaction.response.send_message(
             embed=embed,
             view=JobSessionView(
@@ -2765,7 +3050,7 @@ async def jobboard_command(
         title="💼 Astrelius Job Board",
         description=(
             "Earn gold by spending downtime.\n\n"
-            "Press **Work a Job** to open your private job menu."
+            "Press **Work a Job** to open the job menu."
         ),
         color=discord.Color.gold(),
     )
@@ -2777,10 +3062,6 @@ async def jobboard_command(
             "then choose **8, 16, 24, 32, or 40** downtime hours."
         ),
         inline=False,
-    )
-
-    embed.set_footer(
-        text="The Job Board stays public. Your job session and results stay private."
     )
 
     await interaction.response.send_message(
@@ -3266,6 +3547,121 @@ class CancelTrainingConfirmView(discord.ui.View):
         )
 
 
+async def send_training_prompt(
+    interaction: discord.Interaction,
+    *,
+    slot: str,
+    training_name: str,
+    training_type: str,
+    ephemeral: bool,
+) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=ephemeral,
+        )
+        return
+
+    rules = TRAINING_RULES[training_type]
+    cost = int(rules["cost"])
+    total_weeks = int(rules["weeks"])
+
+    row = await db().fetchrow(
+        """
+        SELECT *
+        FROM characters
+        WHERE guild_id=$1
+        AND user_id=$2
+        AND slot=$3
+        """,
+        interaction.guild_id,
+        interaction.user.id,
+        slot,
+    )
+
+    if not row:
+        await interaction.response.send_message(
+            (
+                f"You do not have a {slot} character yet. "
+                "Use `/character create` first."
+            ),
+            ephemeral=ephemeral,
+        )
+        return
+
+    active_type = row["training_type"]
+    current_week = int(row["training_week"] or 0)
+
+    if active_type:
+        same_training_type = (
+            str(active_type) == training_type
+        )
+
+        if not same_training_type:
+            await interaction.response.send_message(
+                (
+                    f"Your {slot} character is already training "
+                    f"**{active_type}** at Week {current_week}.\n"
+                    "Cancel the current training before switching types."
+                ),
+                ephemeral=ephemeral,
+            )
+            return
+    else:
+        current_week = 0
+
+    if current_week >= total_weeks:
+        await interaction.response.send_message(
+            "That training is already complete.",
+            ephemeral=ephemeral,
+        )
+        return
+
+    current_gold = int(row["gold"])
+    current_downtime = int(row["downtime_hours"])
+
+    if current_downtime < TRAINING_DOWNTIME_COST:
+        await interaction.response.send_message(
+            (
+                "You need **40 downtime hours** to train for one week. "
+                f"You currently have **{current_downtime}**."
+            ),
+            ephemeral=ephemeral,
+        )
+        return
+
+    if current_gold < cost:
+        await interaction.response.send_message(
+            (
+                f"You need **{cost} Gold** for this training week. "
+                f"You currently have **{current_gold} Gold**."
+            ),
+            ephemeral=ephemeral,
+        )
+        return
+
+    await interaction.response.send_message(
+        embed=training_embed(
+            character_name=str(row["character_name"]),
+            slot=slot,
+            training_name=training_name,
+            training_type=training_type,
+            current_week=current_week,
+            gold=current_gold,
+            downtime=current_downtime,
+        ),
+        view=TrainingConfirmView(
+            user_id=interaction.user.id,
+            guild_id=interaction.guild_id,
+            slot=slot,
+            training_name=training_name,
+            training_type=training_type,
+            expected_week=current_week,
+        ),
+        ephemeral=ephemeral,
+    )
+
+
 @bot.tree.command(
     name="train",
     description="Spend 40 downtime hours to advance your current training",
@@ -3280,112 +3676,11 @@ async def train_command(
     training: app_commands.Range[str, 1, 100],
     training_type: app_commands.Choice[str],
 ):
-    if interaction.guild_id is None:
-        await interaction.response.send_message(
-            "Use this command inside the server.",
-            ephemeral=False,
-        )
-        return
-
-    training_name = training.strip()
-    rules = TRAINING_RULES[training_type.value]
-    cost = int(rules["cost"])
-    total_weeks = int(rules["weeks"])
-
-    row = await db().fetchrow(
-        """
-        SELECT *
-        FROM characters
-        WHERE guild_id=$1
-        AND user_id=$2
-        AND slot=$3
-        """,
-        interaction.guild_id,
-        interaction.user.id,
-        slot.value,
-    )
-
-    if not row:
-        await interaction.response.send_message(
-            (
-                f"You do not have a {slot.value} character yet. "
-                "Use `/character create` first."
-            ),
-            ephemeral=False,
-        )
-        return
-
-    active_name = row["training_name"]
-    active_type = row["training_type"]
-    current_week = int(row["training_week"] or 0)
-
-    if active_type:
-        same_training_type = (
-            str(active_type) == training_type.value
-        )
-
-        if not same_training_type:
-            await interaction.response.send_message(
-                (
-                    f"Your {slot.value} character is already training "
-                    f"**{active_type}** at Week {current_week}.\n"
-                    "Use `/canceltraining` first if you want to switch training types."
-                ),
-                ephemeral=False,
-            )
-            return
-
-    else:
-        current_week = 0
-
-    if current_week >= total_weeks:
-        await interaction.response.send_message(
-            "That training is already complete. Start a new training subject.",
-            ephemeral=False,
-        )
-        return
-
-    current_gold = int(row["gold"])
-    current_downtime = int(row["downtime_hours"])
-
-    if current_downtime < TRAINING_DOWNTIME_COST:
-        await interaction.response.send_message(
-            (
-                "You need **40 downtime hours** to train for one week. "
-                f"You currently have **{current_downtime}**."
-            ),
-            ephemeral=False,
-        )
-        return
-
-    if current_gold < cost:
-        await interaction.response.send_message(
-            (
-                f"You need **{cost} Gold** for this training week. "
-                f"You currently have **{current_gold} Gold**."
-            ),
-            ephemeral=False,
-        )
-        return
-
-    await interaction.response.send_message(
-        embed=training_embed(
-            character_name=str(row["character_name"]),
-            slot=slot.value,
-            training_name=training_name,
-            training_type=training_type.value,
-            current_week=current_week,
-            gold=current_gold,
-            downtime=current_downtime,
-        ),
-        view=TrainingConfirmView(
-            user_id=interaction.user.id,
-            guild_id=interaction.guild_id,
-            slot=slot.value,
-            training_name=training_name,
-            training_type=training_type.value,
-            expected_week=current_week,
-        ),
+    await send_training_prompt(
+        interaction,
+        slot=slot.value,
+        training_name=training.strip(),
+        training_type=training_type.value,
         ephemeral=False,
     )
 
@@ -3478,6 +3773,434 @@ async def cancel_training_command(
             training_type=training_type,
             training_week=training_week,
         ),
+        ephemeral=False,
+    )
+
+
+# =========================================================
+# TRAINING BOARD
+# =========================================================
+
+class TrainingSubjectModal(
+    discord.ui.Modal,
+    title="Training",
+):
+    training_name = discord.ui.TextInput(
+        label="What are you training?",
+        placeholder="Example: Elvish or War Caster",
+        min_length=1,
+        max_length=100,
+    )
+
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+        slot: str,
+        training_type: str,
+    ) -> None:
+        super().__init__()
+
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.slot = slot
+        self.training_type = training_type
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if (
+            interaction.user.id != self.user_id
+            or interaction.guild_id != self.guild_id
+        ):
+            await interaction.response.send_message(
+                "This training menu belongs to another player.",
+                ephemeral=True,
+            )
+            return
+
+        await send_training_prompt(
+            interaction,
+            slot=self.slot,
+            training_name=str(self.training_name).strip(),
+            training_type=self.training_type,
+            ephemeral=True,
+        )
+
+
+class TrainingStartView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.selected_slot: str | None = None
+        self.selected_type: str | None = None
+
+        self.slot_select = discord.ui.Select(
+            placeholder="Choose Main or Alt",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Main",
+                    value="Main",
+                ),
+                discord.SelectOption(
+                    label="Alt",
+                    value="Alt",
+                ),
+            ],
+            row=0,
+        )
+
+        self.type_select = discord.ui.Select(
+            placeholder="Choose training type",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Language / Proficiency",
+                    description="50 Gold • 10 weeks",
+                    value="Language / Proficiency",
+                ),
+                discord.SelectOption(
+                    label="Feat",
+                    description="200 Gold • 15 weeks",
+                    value="Feat",
+                ),
+            ],
+            row=1,
+        )
+
+        self.continue_button = discord.ui.Button(
+            label="Continue",
+            emoji="📚",
+            style=discord.ButtonStyle.success,
+            row=2,
+        )
+
+        self.slot_select.callback = self.slot_changed
+        self.type_select.callback = self.type_changed
+        self.continue_button.callback = self.continue_training
+
+        self.add_item(self.slot_select)
+        self.add_item(self.type_select)
+        self.add_item(self.continue_button)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if (
+            interaction.user.id == self.user_id
+            and interaction.guild_id == self.guild_id
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "This training menu belongs to another player.",
+            ephemeral=True,
+        )
+        return False
+
+    async def slot_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_slot = self.slot_select.values[0]
+        await interaction.response.defer()
+
+    async def type_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_type = self.type_select.values[0]
+        await interaction.response.defer()
+
+    async def continue_training(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if self.selected_slot is None:
+            await interaction.response.send_message(
+                "Choose Main or Alt first.",
+                ephemeral=True,
+            )
+            return
+
+        if self.selected_type is None:
+            await interaction.response.send_message(
+                "Choose a training type first.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            TrainingSubjectModal(
+                user_id=self.user_id,
+                guild_id=self.guild_id,
+                slot=self.selected_slot,
+                training_type=self.selected_type,
+            )
+        )
+
+
+class CancelTrainingSlotView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        user_id: int,
+        guild_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.selected_slot: str | None = None
+
+        self.slot_select = discord.ui.Select(
+            placeholder="Choose Main or Alt",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Main",
+                    value="Main",
+                ),
+                discord.SelectOption(
+                    label="Alt",
+                    value="Alt",
+                ),
+            ],
+            row=0,
+        )
+
+        self.continue_button = discord.ui.Button(
+            label="Continue",
+            style=discord.ButtonStyle.danger,
+            row=1,
+        )
+
+        self.slot_select.callback = self.slot_changed
+        self.continue_button.callback = self.continue_cancel
+
+        self.add_item(self.slot_select)
+        self.add_item(self.continue_button)
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if (
+            interaction.user.id == self.user_id
+            and interaction.guild_id == self.guild_id
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "This training menu belongs to another player.",
+            ephemeral=True,
+        )
+        return False
+
+    async def slot_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_slot = self.slot_select.values[0]
+        await interaction.response.defer()
+
+    async def continue_cancel(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if self.selected_slot is None:
+            await interaction.response.send_message(
+                "Choose Main or Alt first.",
+                ephemeral=True,
+            )
+            return
+
+        row = await db().fetchrow(
+            """
+            SELECT character_name, training_name, training_type, training_week
+            FROM characters
+            WHERE guild_id=$1
+            AND user_id=$2
+            AND slot=$3
+            """,
+            self.guild_id,
+            self.user_id,
+            self.selected_slot,
+        )
+
+        if not row:
+            await interaction.response.edit_message(
+                content=(
+                    f"You do not have a {self.selected_slot} character yet."
+                ),
+                embed=None,
+                view=None,
+            )
+            return
+
+        if not row["training_name"]:
+            await interaction.response.edit_message(
+                content=(
+                    f"Your {self.selected_slot} character "
+                    "does not have active training."
+                ),
+                embed=None,
+                view=None,
+            )
+            return
+
+        training_name = str(row["training_name"])
+        training_type = str(row["training_type"])
+        training_week = int(row["training_week"] or 0)
+        total_weeks = int(
+            TRAINING_RULES[training_type]["weeks"]
+        )
+
+        embed = discord.Embed(
+            title="🗑️ Cancel Current Training?",
+            description=(
+                f"**{row['character_name']}** is currently training "
+                f"**{training_name}**."
+            ),
+            color=discord.Color.gold(),
+        )
+
+        embed.add_field(
+            name="Current Progress",
+            value=(
+                f"**Type:** {training_type}\n"
+                f"**Week:** {training_week} / {total_weeks}"
+            ),
+            inline=False,
+        )
+
+        embed.add_field(
+            name="Warning",
+            value=(
+                "Current training progress will be erased. "
+                "Spent gold and downtime are not refunded."
+            ),
+            inline=False,
+        )
+
+        await interaction.response.edit_message(
+            content=None,
+            embed=embed,
+            view=CancelTrainingConfirmView(
+                user_id=self.user_id,
+                guild_id=self.guild_id,
+                slot=self.selected_slot,
+                training_name=training_name,
+                training_type=training_type,
+                training_week=training_week,
+            ),
+        )
+
+
+class TrainingBoardView(discord.ui.View):
+    def __init__(self) -> None:
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="Train",
+        emoji="📚",
+        style=discord.ButtonStyle.primary,
+        custom_id="astrelius:trainingboard:train",
+    )
+    async def train(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Use this inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="📚 Training",
+            description="Choose a character and training type.",
+            color=discord.Color.gold(),
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=TrainingStartView(
+                user_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+            ),
+            ephemeral=True,
+        )
+
+    @discord.ui.button(
+        label="Cancel Training",
+        emoji="🗑️",
+        style=discord.ButtonStyle.secondary,
+        custom_id="astrelius:trainingboard:cancel",
+    )
+    async def cancel_training(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if interaction.guild_id is None:
+            await interaction.response.send_message(
+                "Use this inside the server.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="🗑️ Cancel Training",
+            description="Choose the character.",
+            color=discord.Color.gold(),
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=CancelTrainingSlotView(
+                user_id=interaction.user.id,
+                guild_id=interaction.guild_id,
+            ),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="trainingboard",
+    description="Post the Astrelius Training panel",
+)
+@app_commands.check(
+    staff_check
+)
+async def trainingboard_command(
+    interaction: discord.Interaction,
+):
+    embed = discord.Embed(
+        title="📚 Astrelius Training",
+        description="Train languages, proficiencies, or feats.",
+        color=discord.Color.gold(),
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=TrainingBoardView(),
         ephemeral=False,
     )
 
