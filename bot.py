@@ -2602,17 +2602,15 @@ class TrainingConfirmView(discord.ui.View):
                 active_type = row["training_type"]
                 current_week = int(row["training_week"] or 0)
 
-                if active_name:
-                    same_training = (
-                        str(active_name).casefold()
-                        == self.training_name.casefold()
-                        and str(active_type) == self.training_type
+                if active_type:
+                    same_training_type = (
+                        str(active_type) == self.training_type
                     )
 
-                    if not same_training:
+                    if not same_training_type:
                         await interaction.edit_original_response(
                             content=(
-                                "Your active training changed before this was confirmed. "
+                                "Your active training type changed before this was confirmed. "
                                 "Run `/train` again."
                             ),
                             embed=None,
@@ -2984,18 +2982,17 @@ async def train_command(
     active_type = row["training_type"]
     current_week = int(row["training_week"] or 0)
 
-    if active_name:
-        same_training = (
-            str(active_name).casefold() == training_name.casefold()
-            and str(active_type) == training_type.value
+    if active_type:
+        same_training_type = (
+            str(active_type) == training_type.value
         )
 
-        if not same_training:
+        if not same_training_type:
             await interaction.response.send_message(
                 (
                     f"Your {slot.value} character is already training "
-                    f"**{active_name}** ({active_type}) at Week {current_week}.\n"
-                    "Use `/canceltraining` first if you want to train something else."
+                    f"**{active_type}** at Week {current_week}.\n"
+                    "Use `/canceltraining` first if you want to switch training types."
                 ),
                 ephemeral=False,
             )
