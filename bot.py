@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import asyncpg
@@ -14,7 +15,7 @@ import discord
 import fitz
 import pytesseract
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from PIL import Image
 
 
@@ -846,6 +847,27 @@ class DndBot(commands.Bot):
         self.add_view(TrainingBoardView())
         self.add_view(InventoryBoardView())
 
+        active_auctions = await self.pool.fetch(
+            """
+            SELECT auction_id, message_id, buy_now_price
+            FROM auctions
+            WHERE status='active'
+            AND message_id IS NOT NULL
+            """
+        )
+
+        for auction in active_auctions:
+            self.add_view(
+                AuctionView(
+                    auction_id=int(auction["auction_id"]),
+                    has_buy_now=auction["buy_now_price"] is not None,
+                ),
+                message_id=int(auction["message_id"]),
+            )
+
+        if not auction_expiry_loop.is_running():
+            auction_expiry_loop.start()
+
         await self.tree.sync()
 
         log.info(
@@ -932,6 +954,88 @@ ADD COLUMN IF NOT EXISTS training_type TEXT;
 
 ALTER TABLE characters
 ADD COLUMN IF NOT EXISTS training_week SMALLINT NOT NULL DEFAULT 0;
+
+CREATE TABLE IF NOT EXISTS auctions (
+    auction_id BIGSERIAL PRIMARY KEY,
+
+    guild_id BIGINT NOT NULL,
+    channel_id BIGINT,
+    message_id BIGINT,
+    thread_id BIGINT,
+
+    seller_user_id BIGINT NOT NULL,
+    seller_slot TEXT NOT NULL CHECK (
+        seller_slot IN ('Main', 'Alt')
+    ),
+
+    item_name TEXT NOT NULL,
+    item_description TEXT NOT NULL,
+
+    starting_price INTEGER NOT NULL CHECK (
+        starting_price > 0
+    ),
+
+    buy_now_price INTEGER CHECK (
+        buy_now_price IS NULL
+        OR buy_now_price > 0
+    ),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    ends_at TIMESTAMPTZ NOT NULL,
+
+    status TEXT NOT NULL DEFAULT 'active' CHECK (
+        status IN (
+            'active',
+            'completed',
+            'ended_no_bids',
+            'ended_no_valid_bid',
+            'cancelled'
+        )
+    ),
+
+    winner_user_id BIGINT,
+    winner_slot TEXT CHECK (
+        winner_slot IS NULL
+        OR winner_slot IN ('Main', 'Alt')
+    ),
+    winning_amount INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS auction_bids (
+    auction_id BIGINT NOT NULL
+        REFERENCES auctions(auction_id)
+        ON DELETE CASCADE,
+
+    guild_id BIGINT NOT NULL,
+    bidder_user_id BIGINT NOT NULL,
+    bidder_slot TEXT NOT NULL CHECK (
+        bidder_slot IN ('Main', 'Alt')
+    ),
+
+    amount INTEGER NOT NULL CHECK (
+        amount > 0
+    ),
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    PRIMARY KEY (
+        auction_id,
+        bidder_user_id,
+        bidder_slot
+    )
+);
+
+CREATE INDEX IF NOT EXISTS auctions_active_ends_idx
+ON auctions (ends_at)
+WHERE status = 'active';
+
+CREATE INDEX IF NOT EXISTS auction_bids_bidder_idx
+ON auction_bids (
+    guild_id,
+    bidder_user_id,
+    bidder_slot
+);
 """
 
 
@@ -3128,6 +3232,16 @@ class TrainingConfirmView(discord.ui.View):
                     return
 
                 current_gold = int(row["gold"])
+                reserved_gold = await reserved_auction_gold(
+                    connection,
+                    guild_id=self.guild_id,
+                    user_id=self.user_id,
+                    slot=self.slot,
+                )
+                available_gold = max(
+                    0,
+                    current_gold - reserved_gold,
+                )
                 current_downtime = int(row["downtime_hours"])
 
                 if current_downtime < TRAINING_DOWNTIME_COST:
@@ -3141,11 +3255,12 @@ class TrainingConfirmView(discord.ui.View):
                     )
                     return
 
-                if current_gold < cost:
+                if available_gold < cost:
                     await interaction.edit_original_response(
                         content=(
                             f"You need **{cost} Gold** for this training week. "
-                            f"You currently have **{current_gold} Gold**."
+                            f"You currently have **{available_gold} Gold available** "
+                            "after active auction bids."
                         ),
                         embed=None,
                         view=None,
@@ -3496,6 +3611,16 @@ async def send_training_prompt(
         return
 
     current_gold = int(row["gold"])
+    reserved_gold = await reserved_auction_gold(
+        db(),
+        guild_id=interaction.guild_id,
+        user_id=interaction.user.id,
+        slot=slot,
+    )
+    available_gold = max(
+        0,
+        current_gold - reserved_gold,
+    )
     current_downtime = int(row["downtime_hours"])
 
     if current_downtime < TRAINING_DOWNTIME_COST:
@@ -3508,11 +3633,12 @@ async def send_training_prompt(
         )
         return
 
-    if current_gold < cost:
+    if available_gold < cost:
         await interaction.response.send_message(
             (
                 f"You need **{cost} Gold** for this training week. "
-                f"You currently have **{current_gold} Gold**."
+                f"You currently have **{available_gold} Gold available** "
+                "after active auction bids."
             ),
             ephemeral=ephemeral,
         )
@@ -5188,6 +5314,1409 @@ async def questreward(
         ),
         ephemeral=True,
     )
+
+
+
+# =========================================================
+# AUCTION HOUSE
+# =========================================================
+
+AUCTION_DURATION = timedelta(days=3)
+
+
+async def reserved_auction_gold(
+    connection,
+    *,
+    guild_id: int,
+    user_id: int,
+    slot: str,
+    exclude_auction_id: int | None = None,
+) -> int:
+    if exclude_auction_id is None:
+        value = await connection.fetchval(
+            """
+            SELECT COALESCE(SUM(b.amount), 0)
+            FROM auction_bids b
+            JOIN auctions a
+              ON a.auction_id = b.auction_id
+            WHERE a.status='active'
+            AND b.guild_id=$1
+            AND b.bidder_user_id=$2
+            AND b.bidder_slot=$3
+            """,
+            guild_id,
+            user_id,
+            slot,
+        )
+    else:
+        value = await connection.fetchval(
+            """
+            SELECT COALESCE(SUM(b.amount), 0)
+            FROM auction_bids b
+            JOIN auctions a
+              ON a.auction_id = b.auction_id
+            WHERE a.status='active'
+            AND b.guild_id=$1
+            AND b.bidder_user_id=$2
+            AND b.bidder_slot=$3
+            AND b.auction_id <> $4
+            """,
+            guild_id,
+            user_id,
+            slot,
+            exclude_auction_id,
+        )
+
+    return int(value or 0)
+
+
+async def available_gold_for_character(
+    connection,
+    *,
+    guild_id: int,
+    user_id: int,
+    slot: str,
+    exclude_auction_id: int | None = None,
+    lock: bool = False,
+):
+    query = """
+        SELECT *
+        FROM characters
+        WHERE guild_id=$1
+        AND user_id=$2
+        AND slot=$3
+    """
+
+    if lock:
+        query += " FOR UPDATE"
+
+    row = await connection.fetchrow(
+        query,
+        guild_id,
+        user_id,
+        slot,
+    )
+
+    if not row:
+        return None, 0, 0
+
+    reserved = await reserved_auction_gold(
+        connection,
+        guild_id=guild_id,
+        user_id=user_id,
+        slot=slot,
+        exclude_auction_id=exclude_auction_id,
+    )
+
+    total_gold = max(0, int(row["gold"]))
+    available = max(0, total_gold - reserved)
+
+    return row, reserved, available
+
+
+def auction_embed(
+    auction,
+) -> discord.Embed:
+    status = str(auction["status"])
+    active = status == "active"
+
+    embed = discord.Embed(
+        title=f"🔨 Auction #{auction['auction_id']}: {auction['item_name']}",
+        description=str(auction["item_description"]),
+        color=(
+            discord.Color.gold()
+            if active
+            else discord.Color.dark_grey()
+        ),
+    )
+
+    embed.add_field(
+        name="Starting Price",
+        value=f"{int(auction['starting_price'])} Gold",
+        inline=True,
+    )
+
+    if auction["buy_now_price"] is not None:
+        embed.add_field(
+            name="Buy Now",
+            value=f"{int(auction['buy_now_price'])} Gold",
+            inline=True,
+        )
+
+    if active:
+        ends_at = auction["ends_at"]
+        timestamp = int(ends_at.timestamp())
+
+        embed.add_field(
+            name="Ends",
+            value=(
+                f"<t:{timestamp}:F>\n"
+                f"<t:{timestamp}:R>"
+            ),
+            inline=False,
+        )
+
+        embed.set_footer(
+            text="Bids are silent. Bidder names and amounts stay hidden until the auction ends."
+        )
+
+    else:
+        status_text = {
+            "completed": "Ended",
+            "ended_no_bids": "Ended • No bids",
+            "ended_no_valid_bid": "Ended • No valid winner",
+            "cancelled": "Cancelled",
+        }.get(status, "Ended")
+
+        embed.add_field(
+            name="Status",
+            value=status_text,
+            inline=False,
+        )
+
+        if auction["winning_amount"] is not None:
+            embed.add_field(
+                name="Winning Price",
+                value=f"{int(auction['winning_amount'])} Gold",
+                inline=True,
+            )
+
+    return embed
+
+
+async def get_auction_thread(
+    auction,
+):
+    thread_id = auction["thread_id"]
+
+    if thread_id is None:
+        return None
+
+    thread = bot.get_channel(int(thread_id))
+
+    if thread is not None:
+        return thread
+
+    try:
+        return await bot.fetch_channel(
+            int(thread_id)
+        )
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException,
+    ):
+        return None
+
+
+async def post_auction_thread_message(
+    auction,
+    content: str,
+) -> None:
+    thread = await get_auction_thread(
+        auction
+    )
+
+    if thread is None:
+        return
+
+    try:
+        await thread.send(
+            content
+        )
+    except (
+        discord.Forbidden,
+        discord.HTTPException,
+    ):
+        pass
+
+
+async def refresh_auction_message(
+    auction_id: int,
+) -> None:
+    auction = await db().fetchrow(
+        """
+        SELECT *
+        FROM auctions
+        WHERE auction_id=$1
+        """,
+        auction_id,
+    )
+
+    if not auction:
+        return
+
+    if (
+        auction["channel_id"] is None
+        or auction["message_id"] is None
+    ):
+        return
+
+    channel = bot.get_channel(
+        int(auction["channel_id"])
+    )
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(
+                int(auction["channel_id"])
+            )
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+        ):
+            return
+
+    try:
+        message = await channel.fetch_message(
+            int(auction["message_id"])
+        )
+
+        if auction["status"] == "active":
+            view = AuctionView(
+                auction_id=int(auction["auction_id"]),
+                has_buy_now=auction["buy_now_price"] is not None,
+            )
+        else:
+            view = None
+
+        await message.edit(
+            embed=auction_embed(
+                auction
+            ),
+            view=view,
+        )
+
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException,
+    ):
+        pass
+
+
+async def place_auction_bid(
+    *,
+    auction_id: int,
+    bidder_user_id: int,
+    bidder_slot: str,
+    amount: int,
+) -> tuple[bool, str]:
+    if amount <= 0:
+        return False, "Bid amount must be greater than 0."
+
+    async with db().acquire() as connection:
+        async with connection.transaction():
+            auction = await connection.fetchrow(
+                """
+                SELECT *
+                FROM auctions
+                WHERE auction_id=$1
+                FOR UPDATE
+                """,
+                auction_id,
+            )
+
+            if not auction:
+                return False, "That auction no longer exists."
+
+            if auction["status"] != "active":
+                return False, "That auction has already ended."
+
+            now = datetime.now(timezone.utc)
+
+            if auction["ends_at"] <= now:
+                return False, "That auction has already reached its ending time."
+
+            if int(auction["seller_user_id"]) == bidder_user_id:
+                return False, "You cannot bid on your own auction."
+
+            starting_price = int(
+                auction["starting_price"]
+            )
+
+            highest_bid = await connection.fetchval(
+                """
+                SELECT MAX(amount)
+                FROM auction_bids
+                WHERE auction_id=$1
+                """,
+                auction_id,
+            )
+
+            if highest_bid is None:
+                if amount < starting_price:
+                    return (
+                        False,
+                        f"The first bid must be at least **{starting_price} Gold**.",
+                    )
+            elif amount <= int(highest_bid):
+                return (
+                    False,
+                    "Your bid was not high enough.",
+                )
+
+            buy_now_price = auction["buy_now_price"]
+
+            if (
+                buy_now_price is not None
+                and amount >= int(buy_now_price)
+            ):
+                return (
+                    False,
+                    "That amount reaches the Buy Now price. Use **Buy Now** instead.",
+                )
+
+            character, reserved_elsewhere, available = (
+                await available_gold_for_character(
+                    connection,
+                    guild_id=int(auction["guild_id"]),
+                    user_id=bidder_user_id,
+                    slot=bidder_slot,
+                    exclude_auction_id=auction_id,
+                    lock=True,
+                )
+            )
+
+            if not character:
+                return (
+                    False,
+                    f"You do not have a {bidder_slot} character yet.",
+                )
+
+            if available < amount:
+                return (
+                    False,
+                    (
+                        f"You only have **{available} Gold available** for bids "
+                        f"after your other active auction bids."
+                    ),
+                )
+
+            await connection.execute(
+                """
+                INSERT INTO auction_bids (
+                    auction_id,
+                    guild_id,
+                    bidder_user_id,
+                    bidder_slot,
+                    amount
+                )
+                VALUES ($1,$2,$3,$4,$5)
+
+                ON CONFLICT (
+                    auction_id,
+                    bidder_user_id,
+                    bidder_slot
+                )
+                DO UPDATE SET
+                    amount=EXCLUDED.amount,
+                    updated_at=now()
+                """,
+                auction_id,
+                int(auction["guild_id"]),
+                bidder_user_id,
+                bidder_slot,
+                amount,
+            )
+
+    auction = await db().fetchrow(
+        """
+        SELECT *
+        FROM auctions
+        WHERE auction_id=$1
+        """,
+        auction_id,
+    )
+
+    if auction:
+        await post_auction_thread_message(
+            auction,
+            "🔨 A new bid has been placed.",
+        )
+
+    return (
+        True,
+        f"Your silent bid of **{amount} Gold** was accepted.",
+    )
+
+
+async def complete_auction_buy_now(
+    *,
+    auction_id: int,
+    buyer_user_id: int,
+    buyer_slot: str,
+) -> tuple[bool, str]:
+    async with db().acquire() as connection:
+        async with connection.transaction():
+            auction = await connection.fetchrow(
+                """
+                SELECT *
+                FROM auctions
+                WHERE auction_id=$1
+                FOR UPDATE
+                """,
+                auction_id,
+            )
+
+            if not auction:
+                return False, "That auction no longer exists."
+
+            if auction["status"] != "active":
+                return False, "That auction has already ended."
+
+            if auction["ends_at"] <= datetime.now(timezone.utc):
+                return False, "That auction has already reached its ending time."
+
+            if int(auction["seller_user_id"]) == buyer_user_id:
+                return False, "You cannot buy your own auction."
+
+            if auction["buy_now_price"] is None:
+                return False, "This auction does not have a Buy Now price."
+
+            price = int(
+                auction["buy_now_price"]
+            )
+
+            buyer, _, available = (
+                await available_gold_for_character(
+                    connection,
+                    guild_id=int(auction["guild_id"]),
+                    user_id=buyer_user_id,
+                    slot=buyer_slot,
+                    exclude_auction_id=auction_id,
+                    lock=True,
+                )
+            )
+
+            if not buyer:
+                return (
+                    False,
+                    f"You do not have a {buyer_slot} character yet.",
+                )
+
+            if available < price:
+                return (
+                    False,
+                    (
+                        f"You need **{price} Gold** to use Buy Now. "
+                        f"You currently have **{available} Gold available**."
+                    ),
+                )
+
+            seller = await connection.fetchrow(
+                """
+                SELECT *
+                FROM characters
+                WHERE guild_id=$1
+                AND user_id=$2
+                AND slot=$3
+                FOR UPDATE
+                """,
+                int(auction["guild_id"]),
+                int(auction["seller_user_id"]),
+                str(auction["seller_slot"]),
+            )
+
+            if not seller:
+                return (
+                    False,
+                    "The seller's character no longer exists, so this auction cannot be completed.",
+                )
+
+            await connection.execute(
+                """
+                UPDATE characters
+                SET gold=gold-$1,
+                    updated_at=now()
+                WHERE guild_id=$2
+                AND user_id=$3
+                AND slot=$4
+                """,
+                price,
+                int(auction["guild_id"]),
+                buyer_user_id,
+                buyer_slot,
+            )
+
+            await connection.execute(
+                """
+                UPDATE characters
+                SET gold=gold+$1,
+                    updated_at=now()
+                WHERE guild_id=$2
+                AND user_id=$3
+                AND slot=$4
+                """,
+                price,
+                int(auction["guild_id"]),
+                int(auction["seller_user_id"]),
+                str(auction["seller_slot"]),
+            )
+
+            await connection.execute(
+                """
+                UPDATE auctions
+                SET status='completed',
+                    winner_user_id=$1,
+                    winner_slot=$2,
+                    winning_amount=$3
+                WHERE auction_id=$4
+                """,
+                buyer_user_id,
+                buyer_slot,
+                price,
+                auction_id,
+            )
+
+    finished = await db().fetchrow(
+        """
+        SELECT *
+        FROM auctions
+        WHERE auction_id=$1
+        """,
+        auction_id,
+    )
+
+    if finished:
+        await post_auction_thread_message(
+            finished,
+            (
+                f"🎉 Congratulations <@{buyer_user_id}>! "
+                f"You won this auction with Buy Now for **{price} Gold**!"
+            ),
+        )
+
+    await refresh_auction_message(
+        auction_id
+    )
+
+    return (
+        True,
+        f"You bought **{finished['item_name'] if finished else 'the auction item'}** for **{price} Gold**.",
+    )
+
+
+async def resolve_expired_auction(
+    auction_id: int,
+) -> None:
+    winner_user_id: int | None = None
+    winner_slot: str | None = None
+    winning_amount: int | None = None
+    final_status = "ended_no_bids"
+
+    async with db().acquire() as connection:
+        async with connection.transaction():
+            auction = await connection.fetchrow(
+                """
+                SELECT *
+                FROM auctions
+                WHERE auction_id=$1
+                FOR UPDATE
+                """,
+                auction_id,
+            )
+
+            if not auction:
+                return
+
+            if auction["status"] != "active":
+                return
+
+            if auction["ends_at"] > datetime.now(timezone.utc):
+                return
+
+            seller = await connection.fetchrow(
+                """
+                SELECT *
+                FROM characters
+                WHERE guild_id=$1
+                AND user_id=$2
+                AND slot=$3
+                FOR UPDATE
+                """,
+                int(auction["guild_id"]),
+                int(auction["seller_user_id"]),
+                str(auction["seller_slot"]),
+            )
+
+            bids = await connection.fetch(
+                """
+                SELECT *
+                FROM auction_bids
+                WHERE auction_id=$1
+                ORDER BY amount DESC, updated_at ASC
+                """,
+                auction_id,
+            )
+
+            if not bids:
+                final_status = "ended_no_bids"
+
+            elif not seller:
+                final_status = "ended_no_valid_bid"
+
+            else:
+                for bid in bids:
+                    candidate_user_id = int(
+                        bid["bidder_user_id"]
+                    )
+                    candidate_slot = str(
+                        bid["bidder_slot"]
+                    )
+                    candidate_amount = int(
+                        bid["amount"]
+                    )
+
+                    bidder, _, available = (
+                        await available_gold_for_character(
+                            connection,
+                            guild_id=int(auction["guild_id"]),
+                            user_id=candidate_user_id,
+                            slot=candidate_slot,
+                            exclude_auction_id=auction_id,
+                            lock=True,
+                        )
+                    )
+
+                    if not bidder:
+                        continue
+
+                    if available < candidate_amount:
+                        continue
+
+                    winner_user_id = candidate_user_id
+                    winner_slot = candidate_slot
+                    winning_amount = candidate_amount
+                    final_status = "completed"
+
+                    await connection.execute(
+                        """
+                        UPDATE characters
+                        SET gold=gold-$1,
+                            updated_at=now()
+                        WHERE guild_id=$2
+                        AND user_id=$3
+                        AND slot=$4
+                        """,
+                        candidate_amount,
+                        int(auction["guild_id"]),
+                        candidate_user_id,
+                        candidate_slot,
+                    )
+
+                    await connection.execute(
+                        """
+                        UPDATE characters
+                        SET gold=gold+$1,
+                            updated_at=now()
+                        WHERE guild_id=$2
+                        AND user_id=$3
+                        AND slot=$4
+                        """,
+                        candidate_amount,
+                        int(auction["guild_id"]),
+                        int(auction["seller_user_id"]),
+                        str(auction["seller_slot"]),
+                    )
+
+                    break
+
+                if winner_user_id is None:
+                    final_status = "ended_no_valid_bid"
+
+            await connection.execute(
+                """
+                UPDATE auctions
+                SET status=$1,
+                    winner_user_id=$2,
+                    winner_slot=$3,
+                    winning_amount=$4
+                WHERE auction_id=$5
+                """,
+                final_status,
+                winner_user_id,
+                winner_slot,
+                winning_amount,
+                auction_id,
+            )
+
+    finished = await db().fetchrow(
+        """
+        SELECT *
+        FROM auctions
+        WHERE auction_id=$1
+        """,
+        auction_id,
+    )
+
+    if not finished:
+        return
+
+    if final_status == "completed":
+        await post_auction_thread_message(
+            finished,
+            (
+                f"🏆 Congratulations <@{winner_user_id}>! "
+                f"You won this auction for **{winning_amount} Gold**!"
+            ),
+        )
+
+    elif final_status == "ended_no_bids":
+        await post_auction_thread_message(
+            finished,
+            "⏰ This auction has ended with no bids.",
+        )
+
+    else:
+        await post_auction_thread_message(
+            finished,
+            "⏰ This auction ended without a valid winner.",
+        )
+
+    await refresh_auction_message(
+        auction_id
+    )
+
+
+@tasks.loop(minutes=1)
+async def auction_expiry_loop():
+    rows = await db().fetch(
+        """
+        SELECT auction_id
+        FROM auctions
+        WHERE status='active'
+        AND ends_at <= now()
+        ORDER BY ends_at ASC
+        LIMIT 50
+        """
+    )
+
+    for row in rows:
+        try:
+            await resolve_expired_auction(
+                int(row["auction_id"])
+            )
+        except Exception:
+            log.exception(
+                "Failed to resolve auction %s",
+                row["auction_id"],
+            )
+
+
+@auction_expiry_loop.before_loop
+async def before_auction_expiry_loop():
+    await bot.wait_until_ready()
+
+
+class BidAmountModal(
+    discord.ui.Modal,
+    title="Place Silent Bid",
+):
+    amount = discord.ui.TextInput(
+        label="Bid amount",
+        placeholder="Enter the amount of gold to bid",
+        min_length=1,
+        max_length=12,
+    )
+
+    def __init__(
+        self,
+        *,
+        auction_id: int,
+        user_id: int,
+        guild_id: int,
+        slot: str,
+    ) -> None:
+        super().__init__()
+
+        self.auction_id = auction_id
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.slot = slot
+
+    async def on_submit(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if (
+            interaction.user.id != self.user_id
+            or interaction.guild_id != self.guild_id
+        ):
+            await interaction.response.send_message(
+                "This bid form belongs to another player.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            amount = int(
+                str(self.amount).replace(",", "").strip()
+            )
+        except ValueError:
+            await interaction.response.send_message(
+                "Enter a whole number for the bid amount.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        success, message = await place_auction_bid(
+            auction_id=self.auction_id,
+            bidder_user_id=self.user_id,
+            bidder_slot=self.slot,
+            amount=amount,
+        )
+
+        await interaction.followup.send(
+            message,
+            ephemeral=True,
+        )
+
+
+class BidSlotView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        auction_id: int,
+        user_id: int,
+        guild_id: int,
+    ) -> None:
+        super().__init__(timeout=300)
+
+        self.auction_id = auction_id
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.selected_slot: str | None = None
+
+        self.slot_select = discord.ui.Select(
+            placeholder="Choose Main or Alt",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Main",
+                    value="Main",
+                ),
+                discord.SelectOption(
+                    label="Alt",
+                    value="Alt",
+                ),
+            ],
+            row=0,
+        )
+
+        self.continue_button = discord.ui.Button(
+            label="Enter Bid",
+            emoji="🔨",
+            style=discord.ButtonStyle.success,
+            row=1,
+        )
+
+        self.slot_select.callback = self.slot_changed
+        self.continue_button.callback = self.continue_bid
+
+        self.add_item(
+            self.slot_select
+        )
+        self.add_item(
+            self.continue_button
+        )
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if (
+            interaction.user.id == self.user_id
+            and interaction.guild_id == self.guild_id
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "This bidding menu belongs to another player.",
+            ephemeral=True,
+        )
+        return False
+
+    async def slot_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_slot = self.slot_select.values[0]
+        await interaction.response.defer()
+
+    async def continue_bid(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if self.selected_slot is None:
+            await interaction.response.send_message(
+                "Choose Main or Alt first.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_modal(
+            BidAmountModal(
+                auction_id=self.auction_id,
+                user_id=self.user_id,
+                guild_id=self.guild_id,
+                slot=self.selected_slot,
+            )
+        )
+
+
+class BuyNowSlotView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        auction_id: int,
+        user_id: int,
+        guild_id: int,
+        buy_now_price: int,
+    ) -> None:
+        super().__init__(timeout=300)
+
+        self.auction_id = auction_id
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.buy_now_price = buy_now_price
+        self.selected_slot: str | None = None
+        self.processed = False
+
+        self.slot_select = discord.ui.Select(
+            placeholder="Choose Main or Alt",
+            min_values=1,
+            max_values=1,
+            options=[
+                discord.SelectOption(
+                    label="Main",
+                    value="Main",
+                ),
+                discord.SelectOption(
+                    label="Alt",
+                    value="Alt",
+                ),
+            ],
+            row=0,
+        )
+
+        self.confirm_button = discord.ui.Button(
+            label=f"Buy Now • {buy_now_price} Gold",
+            emoji="💰",
+            style=discord.ButtonStyle.danger,
+            row=1,
+        )
+
+        self.slot_select.callback = self.slot_changed
+        self.confirm_button.callback = self.confirm_buy
+
+        self.add_item(
+            self.slot_select
+        )
+        self.add_item(
+            self.confirm_button
+        )
+
+    async def interaction_check(
+        self,
+        interaction: discord.Interaction,
+    ) -> bool:
+        if (
+            interaction.user.id == self.user_id
+            and interaction.guild_id == self.guild_id
+        ):
+            return True
+
+        await interaction.response.send_message(
+            "This Buy Now menu belongs to another player.",
+            ephemeral=True,
+        )
+        return False
+
+    async def slot_changed(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        self.selected_slot = self.slot_select.values[0]
+        await interaction.response.defer()
+
+    async def confirm_buy(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        if self.processed:
+            await interaction.response.send_message(
+                "This Buy Now request has already been processed.",
+                ephemeral=True,
+            )
+            return
+
+        if self.selected_slot is None:
+            await interaction.response.send_message(
+                "Choose Main or Alt first.",
+                ephemeral=True,
+            )
+            return
+
+        self.processed = True
+
+        await interaction.response.defer(
+            ephemeral=True,
+            thinking=True,
+        )
+
+        success, message = await complete_auction_buy_now(
+            auction_id=self.auction_id,
+            buyer_user_id=self.user_id,
+            buyer_slot=self.selected_slot,
+        )
+
+        if not success:
+            self.processed = False
+
+        await interaction.edit_original_response(
+            content=message,
+            embed=None,
+            view=(
+                None
+                if success
+                else self
+            ),
+        )
+
+
+class AuctionView(discord.ui.View):
+    def __init__(
+        self,
+        *,
+        auction_id: int,
+        has_buy_now: bool,
+    ) -> None:
+        super().__init__(timeout=None)
+
+        self.auction_id = auction_id
+        self.has_buy_now = has_buy_now
+
+        bid_button = discord.ui.Button(
+            label="Place Bid",
+            emoji="🔨",
+            style=discord.ButtonStyle.primary,
+            custom_id=f"astrelius:auction:{auction_id}:bid",
+        )
+
+        bid_button.callback = self.place_bid
+
+        self.add_item(
+            bid_button
+        )
+
+        if has_buy_now:
+            buy_button = discord.ui.Button(
+                label="Buy Now",
+                emoji="💰",
+                style=discord.ButtonStyle.success,
+                custom_id=f"astrelius:auction:{auction_id}:buy",
+            )
+
+            buy_button.callback = self.buy_now
+
+            self.add_item(
+                buy_button
+            )
+
+    async def get_active_auction(
+        self,
+    ):
+        return await db().fetchrow(
+            """
+            SELECT *
+            FROM auctions
+            WHERE auction_id=$1
+            """,
+            self.auction_id,
+        )
+
+    async def place_bid(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        auction = await self.get_active_auction()
+
+        if not auction or auction["status"] != "active":
+            await interaction.response.send_message(
+                "That auction has already ended.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.user.id == int(auction["seller_user_id"]):
+            await interaction.response.send_message(
+                "You cannot bid on your own auction.",
+                ephemeral=True,
+            )
+            return
+
+        if auction["ends_at"] <= datetime.now(timezone.utc):
+            await interaction.response.send_message(
+                "That auction has already reached its ending time.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            "Choose the character you want to bid with.",
+            view=BidSlotView(
+                auction_id=self.auction_id,
+                user_id=interaction.user.id,
+                guild_id=int(auction["guild_id"]),
+            ),
+            ephemeral=True,
+        )
+
+    async def buy_now(
+        self,
+        interaction: discord.Interaction,
+    ) -> None:
+        auction = await self.get_active_auction()
+
+        if not auction or auction["status"] != "active":
+            await interaction.response.send_message(
+                "That auction has already ended.",
+                ephemeral=True,
+            )
+            return
+
+        if interaction.user.id == int(auction["seller_user_id"]):
+            await interaction.response.send_message(
+                "You cannot buy your own auction.",
+                ephemeral=True,
+            )
+            return
+
+        if auction["buy_now_price"] is None:
+            await interaction.response.send_message(
+                "This auction does not have a Buy Now price.",
+                ephemeral=True,
+            )
+            return
+
+        if auction["ends_at"] <= datetime.now(timezone.utc):
+            await interaction.response.send_message(
+                "That auction has already reached its ending time.",
+                ephemeral=True,
+            )
+            return
+
+        price = int(
+            auction["buy_now_price"]
+        )
+
+        await interaction.response.send_message(
+            (
+                f"Choose the character that will pay "
+                f"**{price} Gold**."
+            ),
+            view=BuyNowSlotView(
+                auction_id=self.auction_id,
+                user_id=interaction.user.id,
+                guild_id=int(auction["guild_id"]),
+                buy_now_price=price,
+            ),
+            ephemeral=True,
+        )
+
+
+@bot.tree.command(
+    name="auction",
+    description="Start a three-day silent auction",
+)
+@app_commands.choices(
+    slot=SLOTS,
+)
+@app_commands.describe(
+    slot="Character receiving the auction payment",
+    item="What you are selling",
+    description="What the item does or what is included",
+    starting_price="Minimum opening bid",
+    buy_now_price="Optional price that ends the auction immediately",
+)
+async def auction_command(
+    interaction: discord.Interaction,
+    slot: app_commands.Choice[str],
+    item: app_commands.Range[str, 1, 100],
+    description: app_commands.Range[str, 1, 1000],
+    starting_price: app_commands.Range[int, 1, 1_000_000_000],
+    buy_now_price: int | None = None,
+):
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    if buy_now_price is not None:
+        if buy_now_price <= 0:
+            await interaction.response.send_message(
+                "Buy Now must be greater than 0.",
+                ephemeral=True,
+            )
+            return
+
+        if buy_now_price < starting_price:
+            await interaction.response.send_message(
+                "Buy Now cannot be lower than the starting price.",
+                ephemeral=True,
+            )
+            return
+
+    seller = await db().fetchrow(
+        """
+        SELECT *
+        FROM characters
+        WHERE guild_id=$1
+        AND user_id=$2
+        AND slot=$3
+        """,
+        interaction.guild_id,
+        interaction.user.id,
+        slot.value,
+    )
+
+    if not seller:
+        await interaction.response.send_message(
+            f"You do not have a {slot.value} character yet.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    ends_at = (
+        datetime.now(timezone.utc)
+        + AUCTION_DURATION
+    )
+
+    auction_id = await db().fetchval(
+        """
+        INSERT INTO auctions (
+            guild_id,
+            seller_user_id,
+            seller_slot,
+            item_name,
+            item_description,
+            starting_price,
+            buy_now_price,
+            ends_at
+        )
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+        RETURNING auction_id
+        """,
+        interaction.guild_id,
+        interaction.user.id,
+        slot.value,
+        item.strip(),
+        description.strip(),
+        starting_price,
+        buy_now_price,
+        ends_at,
+    )
+
+    auction = await db().fetchrow(
+        """
+        SELECT *
+        FROM auctions
+        WHERE auction_id=$1
+        """,
+        auction_id,
+    )
+
+    view = AuctionView(
+        auction_id=int(auction_id),
+        has_buy_now=buy_now_price is not None,
+    )
+
+    try:
+        auction_message = await interaction.channel.send(
+            embed=auction_embed(
+                auction
+            ),
+            view=view,
+        )
+
+        thread_name = (
+            f"Auction #{auction_id} • {item.strip()}"
+        )[:100]
+
+        try:
+            thread = await auction_message.create_thread(
+                name=thread_name,
+                auto_archive_duration=4320,
+            )
+        except discord.HTTPException:
+            thread = await auction_message.create_thread(
+                name=thread_name,
+                auto_archive_duration=1440,
+            )
+
+        await db().execute(
+            """
+            UPDATE auctions
+            SET channel_id=$1,
+                message_id=$2,
+                thread_id=$3
+            WHERE auction_id=$4
+            """,
+            interaction.channel.id,
+            auction_message.id,
+            thread.id,
+            auction_id,
+        )
+
+        await thread.send(
+            "🔨 Auction opened."
+        )
+
+    except (
+        discord.Forbidden,
+        discord.HTTPException,
+    ) as exc:
+        await db().execute(
+            """
+            UPDATE auctions
+            SET status='cancelled'
+            WHERE auction_id=$1
+            """,
+            auction_id,
+        )
+
+        await interaction.followup.send(
+            (
+                "I could not create the auction post or thread. "
+                "Check my channel and thread permissions."
+            ),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.followup.send(
+        (
+            f"Auction #{auction_id} created. "
+            "It will end in three days."
+        ),
+        ephemeral=True,
+    )
+
 
 
 # =========================================================
