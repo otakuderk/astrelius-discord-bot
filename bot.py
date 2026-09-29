@@ -351,6 +351,72 @@ def find_form_field(
     return ""
 
 
+def parse_proficiency_sections(text: str) -> list[str]:
+    """Return only armor, weapon, tool, and language proficiency entries."""
+    allowed_headers = {"ARMOR", "WEAPONS", "TOOLS", "LANGUAGES"}
+    stop_headers = {
+        "ACTIONS",
+        "BONUS ACTIONS",
+        "REACTIONS",
+        "FEATURES",
+        "FEATURES & TRAITS",
+        "CLASS FEATURES",
+        "EQUIPMENT",
+        "ATTACKS",
+        "ATTACKS & SPELLCASTING",
+        "SPELLS",
+        "PERSONALITY TRAITS",
+        "IDEALS",
+        "BONDS",
+        "FLAWS",
+    }
+
+    proficiencies: list[str] = []
+    current_section: str | None = None
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        header_match = re.fullmatch(
+            r"=?=?=?\s*([A-Za-z &]+?)\s*=?=?=?",
+            line,
+        )
+
+        if header_match:
+            header = re.sub(
+                r"\s+",
+                " ",
+                header_match.group(1).strip().upper(),
+            )
+
+            if header in stop_headers:
+                current_section = None
+                break
+
+            if header in allowed_headers:
+                current_section = header
+                continue
+
+        if current_section not in allowed_headers:
+            continue
+
+        cleaned = line.lstrip("•-* ").strip()
+        if not cleaned:
+            continue
+
+        for entry in re.split(r"[,;•]", cleaned):
+            entry = entry.strip(" •\t")
+            if (
+                1 < len(entry) < 100
+                and entry not in proficiencies
+            ):
+                proficiencies.append(entry)
+
+    return proficiencies
+
+
 # =========================================================
 # FALLBACK SHEET PARSER
 # =========================================================
@@ -474,79 +540,7 @@ def parse_sheet_text(
 
             break
 
-    proficiencies: list[str] = []
-
-    start_index = None
-
-    for i, line in enumerate(lines):
-        if re.search(
-            r"PROFICIENCIES"
-            r"(?:\s*&\s*(?:LANGUAGES|TRAINING))?",
-            line,
-            re.I,
-        ):
-            start_index = i + 1
-            break
-
-    if start_index is not None:
-        stop_headers = {
-            "FEATURES",
-            "FEATURES & TRAITS",
-            "EQUIPMENT",
-            "ATTACKS",
-            "ATTACKS & SPELLCASTING",
-            "SPELLS",
-            "PERSONALITY TRAITS",
-            "IDEALS",
-            "BONDS",
-            "FLAWS",
-            "CLASS FEATURES",
-        }
-
-        ignored_terms = (
-            "HIT POINT",
-            "TEMP HP",
-            "DEATH SAVE",
-            "ARMOR CLASS",
-            "INITIATIVE",
-            "SPEED",
-            "PROFICIENCY BONUS",
-            "PASSIVE WISDOM",
-            "CLASS",
-            "LEVEL",
-            "HIT DICE",
-            "DEFENSE",
-        )
-
-        for line in lines[start_index:]:
-            upper = line.upper().strip()
-
-            if upper in stop_headers:
-                break
-
-            if any(
-                term in upper
-                for term in ignored_terms
-            ):
-                continue
-
-            entries = [
-                item.strip(" •\t")
-                for item in re.split(
-                    r"[,;•]",
-                    line,
-                )
-                if item.strip(" •\t")
-            ]
-
-            for entry in entries:
-                if (
-                    1 < len(entry) < 100
-                    and entry not in proficiencies
-                ):
-                    proficiencies.append(
-                        entry
-                    )
+    proficiencies = parse_proficiency_sections(text)
 
     return SheetData(
         name=name,
@@ -712,8 +706,6 @@ def extract_sheet(
             # PROFICIENCIES
             # -------------------------------------------------
 
-            proficiencies: list[str] = []
-
             training = find_form_field(
                 fields,
                 "ProficienciesLang",
@@ -722,35 +714,11 @@ def extract_sheet(
                 "Proficiencies & Training",
             )
 
-            if training:
-                sections = re.split(
-                    r"===\s*"
-                    r"(?:WEAPONS|TOOLS|LANGUAGES|ARMOR)"
-                    r"\s*===",
-                    training,
-                    flags=re.I,
-                )
-
-                for section in sections:
-                    section = section.strip()
-
-                    if not section:
-                        continue
-
-                    entries = [
-                        item.strip()
-                        for item in re.split(
-                            r"[,;\n]",
-                            section,
-                        )
-                        if item.strip()
-                    ]
-
-                    for entry in entries:
-                        if entry not in proficiencies:
-                            proficiencies.append(
-                                entry
-                            )
+            proficiencies = (
+                parse_proficiency_sections(training)
+                if training
+                else []
+            )
 
             log.info(
                 "Parsed sheet class=%r subclass=%r",
@@ -2198,9 +2166,6 @@ async def import_character_sheet(
     if (
         not parsed.stats
         and not parsed.proficiencies
-        and not parsed.name
-        and not parsed.class_name
-        and not parsed.subclass_name
     ):
         return (
             False,
@@ -2210,33 +2175,18 @@ async def import_character_sheet(
             ),
         )
 
-    # D&D Beyond imports only sheet-derived information.
-    # Server progression and economy values are preserved.
+    # Sheet imports intentionally update only stats and proficiencies.
+    # Character name, class, subclass, progression, and economy are preserved.
     await db().execute(
         """
         UPDATE characters
-        SET character_name=$1,
-            class_name=$2,
-            subclass_name=$3,
-            stats=$4::jsonb,
-            proficiencies=$5::jsonb,
+        SET stats=$1::jsonb,
+            proficiencies=$2::jsonb,
             updated_at=now()
-        WHERE guild_id=$6
-        AND user_id=$7
-        AND slot=$8
+        WHERE guild_id=$3
+        AND user_id=$4
+        AND slot=$5
         """,
-        (
-            parsed.name
-            or existing["character_name"]
-        ),
-        (
-            parsed.class_name
-            or existing["class_name"]
-        ),
-        (
-            parsed.subclass_name
-            or existing["subclass_name"]
-        ),
         parsed.stats,
         parsed.proficiencies,
         guild_id,
@@ -2248,8 +2198,8 @@ async def import_character_sheet(
         True,
         (
             "Sheet imported. "
-            "Class, subclass, stats, and proficiencies updated. "
-            "Server progression was preserved."
+            "Only stats and proficiencies were updated. "
+            "All other character data was preserved."
         ),
     )
 
