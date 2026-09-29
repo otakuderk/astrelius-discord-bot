@@ -356,7 +356,13 @@ def parse_proficiency_sections(
     *,
     dedicated_field: bool = False,
 ) -> list[str]:
-    """Return only Armor, Weapons, Tools, and Languages proficiency entries."""
+    """
+    Read only Armor, Weapons, Tools, and Languages from a D&D Beyond sheet.
+
+    D&D Beyond's text layer can place an ACTIONS heading before the actual
+    proficiency box, so stop headings are only honored after a proficiency
+    section has started.
+    """
     allowed_headers = {"ARMOR", "WEAPONS", "TOOLS", "LANGUAGES"}
     stop_headers = {
         "ACTIONS",
@@ -375,11 +381,17 @@ def parse_proficiency_sections(
         "FLAWS",
     }
 
+    ignored_tokens = {
+        "STR", "DEX", "CON", "INT", "WIS", "CHA",
+        "P", "E",
+    }
+
     proficiencies: list[str] = []
     current_section: str | None = None
+    saw_allowed_section = False
 
     for raw_line in text.splitlines():
-        line = raw_line.strip().lstrip("•*- " ).strip()
+        line = raw_line.strip().lstrip("•*- ").strip()
 
         if not line:
             continue
@@ -390,12 +402,36 @@ def parse_proficiency_sections(
             line,
         ).strip().upper()
 
-        if header_candidate in stop_headers:
-            break
+        explicit_header = (
+            line.startswith("===")
+            and line.endswith("===")
+        )
 
-        if header_candidate in allowed_headers:
+        # In full PDF text, only explicit === SECTION === markers count.
+        # This prevents the separate "ARMOR" and "CLASS" labels from
+        # accidentally opening the proficiency section.
+        is_allowed_header = (
+            header_candidate in allowed_headers
+            and (
+                dedicated_field
+                or explicit_header
+            )
+        )
+
+        if is_allowed_header:
             current_section = header_candidate
+            saw_allowed_section = True
             continue
+
+        if (
+            saw_allowed_section
+            and header_candidate in stop_headers
+            and (
+                dedicated_field
+                or explicit_header
+            )
+        ):
+            break
 
         if not dedicated_field and current_section not in allowed_headers:
             continue
@@ -411,11 +447,100 @@ def parse_proficiency_sections(
                 1 < len(entry) < 100
                 and upper_entry not in allowed_headers
                 and upper_entry not in stop_headers
+                and upper_entry not in ignored_tokens
                 and entry not in proficiencies
             ):
                 proficiencies.append(entry)
 
     return proficiencies
+
+
+def extract_stats_from_pdf_layout(
+    document: fitz.Document,
+) -> dict[str, int]:
+    """
+    Read the six ability scores from the left-hand ability-score column on
+    page 1 of a standard D&D Beyond PDF.
+
+    This avoids the PDF text-order problem where all six labels can be emitted
+    first and the numeric scores much later.
+    """
+    if document.page_count < 1:
+        return {}
+
+    page = document[0]
+    words = page.get_text("words")
+
+    targets = {
+        "STRENGTH": "Strength",
+        "DEXTERITY": "Dexterity",
+        "CONSTITUTION": "Constitution",
+        "INTELLIGENCE": "Intelligence",
+        "WISDOM": "Wisdom",
+        "CHARISMA": "Charisma",
+    }
+
+    stats: dict[str, int] = {}
+
+    # Ability labels and scores live in the narrow left column of page 1.
+    left_words = [
+        word
+        for word in words
+        if float(word[0]) < 100
+    ]
+
+    for label, stat_name in targets.items():
+        label_matches = [
+            word
+            for word in left_words
+            if str(word[4]).strip().upper() == label
+        ]
+
+        if not label_matches:
+            continue
+
+        # Prefer the left-most matching label.
+        label_word = min(
+            label_matches,
+            key=lambda word: (float(word[1]), float(word[0])),
+        )
+
+        label_y = float(label_word[1])
+
+        candidates = []
+
+        for word in left_words:
+            token = str(word[4]).strip()
+
+            if not re.fullmatch(r"\d{1,2}", token):
+                continue
+
+            value = int(token)
+
+            if not (1 <= value <= 30):
+                continue
+
+            x0 = float(word[0])
+            y0 = float(word[1])
+
+            # The score is directly below its ability label.
+            if (
+                35 <= x0 <= 85
+                and label_y < y0 <= label_y + 45
+            ):
+                candidates.append(
+                    (
+                        y0 - label_y,
+                        abs(x0 - 50),
+                        value,
+                    )
+                )
+
+        if candidates:
+            candidates.sort()
+            stats[stat_name] = candidates[0][2]
+
+    return stats
 
 
 def pdf_text_with_ocr_fallback(document: fitz.Document) -> str:
@@ -616,14 +741,35 @@ def extract_sheet(
                     if widget.field_name and widget.field_value is not None:
                         fields[widget.field_name] = str(widget.field_value).strip()
 
-        # Always build a fallback parse from the visible sheet.
-        # This is important because some D&D Beyond PDFs contain form widgets
-        # but do not expose useful ability scores through those widgets.
+        # Always read the visible PDF and page-1 layout.
         visible_text = pdf_text_with_ocr_fallback(document)
         fallback = parse_sheet_text(visible_text)
 
+        layout_stats = extract_stats_from_pdf_layout(document)
+
+        page_one_text = (
+            document[0].get_text("text")
+            if document.page_count >= 1
+            else visible_text
+        )
+
+        page_one_proficiencies = parse_proficiency_sections(
+            page_one_text
+        )
+
+        # Standard D&D Beyond exports often have no interactive form widgets
+        # at all. In that case, use the page-layout scores directly.
         if not fields:
-            return fallback
+            return SheetData(
+                name=fallback.name,
+                class_name=fallback.class_name,
+                subclass_name=fallback.subclass_name,
+                stats=layout_stats or fallback.stats,
+                proficiencies=(
+                    page_one_proficiencies
+                    or fallback.proficiencies
+                ),
+            )
 
         log.info(
             "D&D Beyond PDF form fields detected: %s",
@@ -706,12 +852,13 @@ def extract_sheet(
         # Prefer trustworthy form values, but fill missing pieces from
         # text/OCR so a weird PDF field layout does not make the import fail.
         merged_stats = dict(fallback.stats)
+        merged_stats.update(layout_stats)
         merged_stats.update(stats)
 
         merged_proficiencies = (
             proficiencies
-            if proficiencies
-            else fallback.proficiencies
+            or page_one_proficiencies
+            or fallback.proficiencies
         )
 
         log.info(
