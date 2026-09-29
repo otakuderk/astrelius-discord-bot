@@ -165,6 +165,14 @@ STAT_NAMES = (
     "Charisma",
 )
 
+FACTION_ROLE_NAMES = (
+    "Free Blade",
+    "White Flag",
+    "Blighted",
+    "Saviors",
+    "Hysteria",
+)
+
 
 # =========================================================
 # PROGRESSION
@@ -248,6 +256,26 @@ def discord_rank_for_member(
             return rank
 
     return None
+
+
+def faction_for_member(
+    member: discord.Member,
+) -> str | None:
+    role_names = {
+        role.name
+        for role in member.roles
+    }
+
+    factions = [
+        faction
+        for faction in FACTION_ROLE_NAMES
+        if faction in role_names
+    ]
+
+    if not factions:
+        return None
+
+    return " / ".join(factions)
 
 
 # =========================================================
@@ -955,6 +983,14 @@ ADD COLUMN IF NOT EXISTS training_type TEXT;
 ALTER TABLE characters
 ADD COLUMN IF NOT EXISTS training_week SMALLINT NOT NULL DEFAULT 0;
 
+ALTER TABLE characters
+ADD COLUMN IF NOT EXISTS faction TEXT;
+
+ALTER TABLE characters
+ADD COLUMN IF NOT EXISTS faction_points INTEGER NOT NULL DEFAULT 0 CHECK (
+    faction_points >= 0
+);
+
 CREATE TABLE IF NOT EXISTS auctions (
     auction_id BIGSERIAL PRIMARY KEY,
 
@@ -1419,6 +1455,11 @@ materials_group = app_commands.Group(
     description="DM/GM material management",
 )
 
+faction_points_group = app_commands.Group(
+    name="factionpoints",
+    description="DM/GM faction point management",
+)
+
 
 # =========================================================
 # CHARACTER COMMANDS
@@ -1592,6 +1633,28 @@ async def build_inventory_embed(
 
     display_rank = discord_rank or calculated_rank
 
+    display_faction = row["faction"]
+
+    if isinstance(member, discord.Member):
+        role_faction = faction_for_member(member)
+
+        if role_faction != display_faction:
+            await db().execute(
+                """
+                UPDATE characters
+                SET faction=$1,
+                    updated_at=now()
+                WHERE guild_id=$2
+                AND user_id=$3
+                AND slot=$4
+                """,
+                role_faction,
+                guild_id,
+                member.id,
+                slot,
+            )
+            display_faction = role_faction
+
     class_name = row["class_name"]
     subclass_name = row["subclass_name"]
 
@@ -1637,6 +1700,22 @@ async def build_inventory_embed(
     embed.add_field(
         name="Downtime Hours",
         value=f"{row['downtime_hours']} / 40",
+    )
+
+    embed.add_field(
+        name="Faction",
+        value=(
+            str(display_faction)
+            if display_faction
+            else "None"
+        ),
+    )
+
+    embed.add_field(
+        name="Faction Points",
+        value=str(
+            int(row["faction_points"])
+        ),
     )
 
     stat_abbreviations = {
@@ -6941,6 +7020,186 @@ async def pay_command(
     await interaction.followup.send(
         embed=embed,
         ephemeral=False,
+    )
+
+
+
+
+# =========================================================
+# FACTION POINTS
+# =========================================================
+
+async def change_faction_points(
+    *,
+    guild_id: int,
+    member: discord.Member,
+    slot: str,
+    amount: int,
+    mode: str,
+) -> tuple[bool, str]:
+    async with db().acquire() as connection:
+        async with connection.transaction():
+            row = await connection.fetchrow(
+                """
+                SELECT *
+                FROM characters
+                WHERE guild_id=$1
+                AND user_id=$2
+                AND slot=$3
+                FOR UPDATE
+                """,
+                guild_id,
+                member.id,
+                slot,
+            )
+
+            if not row:
+                return False, f"{member.display_name} does not have a {slot} character."
+
+            current = max(0, int(row["faction_points"]))
+            new_value = current + amount if mode == "add" else max(0, current - amount)
+            faction = faction_for_member(member)
+
+            await connection.execute(
+                """
+                UPDATE characters
+                SET faction_points=$1,
+                    faction=$2,
+                    updated_at=now()
+                WHERE guild_id=$3
+                AND user_id=$4
+                AND slot=$5
+                """,
+                new_value,
+                faction,
+                guild_id,
+                member.id,
+                slot,
+            )
+
+    return True, f"{member.display_name} ({slot}) now has **{new_value} Faction Points**."
+
+
+@faction_points_group.command(
+    name="add",
+    description="Add faction points to one or more characters",
+)
+@app_commands.check(staff_check)
+@app_commands.choices(
+    slot=SLOTS,
+    slot2=SLOTS,
+    slot3=SLOTS,
+    slot4=SLOTS,
+    slot5=SLOTS,
+    slot6=SLOTS,
+    slot7=SLOTS,
+    slot8=SLOTS,
+    slot9=SLOTS,
+    slot10=SLOTS,
+)
+async def faction_points_add(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    slot: app_commands.Choice[str],
+    amount: app_commands.Range[int, 1, 1_000_000],
+    member2: discord.Member | None = None,
+    slot2: app_commands.Choice[str] | None = None,
+    member3: discord.Member | None = None,
+    slot3: app_commands.Choice[str] | None = None,
+    member4: discord.Member | None = None,
+    slot4: app_commands.Choice[str] | None = None,
+    member5: discord.Member | None = None,
+    slot5: app_commands.Choice[str] | None = None,
+    member6: discord.Member | None = None,
+    slot6: app_commands.Choice[str] | None = None,
+    member7: discord.Member | None = None,
+    slot7: app_commands.Choice[str] | None = None,
+    member8: discord.Member | None = None,
+    slot8: app_commands.Choice[str] | None = None,
+    member9: discord.Member | None = None,
+    slot9: app_commands.Choice[str] | None = None,
+    member10: discord.Member | None = None,
+    slot10: app_commands.Choice[str] | None = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    targets = [
+        (member, slot),
+        (member2, slot2),
+        (member3, slot3),
+        (member4, slot4),
+        (member5, slot5),
+        (member6, slot6),
+        (member7, slot7),
+        (member8, slot8),
+        (member9, slot9),
+        (member10, slot10),
+    ]
+
+    cleaned_targets = []
+    seen = set()
+
+    for target_member, target_slot in targets:
+        if target_member is None and target_slot is None:
+            continue
+
+        if target_member is None or target_slot is None:
+            await interaction.followup.send(
+                "Each optional target needs both a player and a Main/Alt slot.",
+                ephemeral=True,
+            )
+            return
+
+        key = (target_member.id, target_slot.value)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        cleaned_targets.append((target_member, target_slot.value))
+
+    results = []
+
+    for target_member, target_slot in cleaned_targets:
+        success, message = await change_faction_points(
+            guild_id=interaction.guild_id,
+            member=target_member,
+            slot=target_slot,
+            amount=amount,
+            mode="add",
+        )
+        results.append(("✅ " if success else "❌ ") + message)
+
+    await interaction.followup.send(
+        "\n".join(results),
+        ephemeral=True,
+    )
+
+
+@faction_points_group.command(
+    name="remove",
+    description="Remove faction points from a character",
+)
+@app_commands.check(staff_check)
+@app_commands.choices(slot=SLOTS)
+async def faction_points_remove(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    slot: app_commands.Choice[str],
+    amount: app_commands.Range[int, 1, 1_000_000],
+):
+    await interaction.response.defer(ephemeral=True)
+
+    success, message = await change_faction_points(
+        guild_id=interaction.guild_id,
+        member=member,
+        slot=slot.value,
+        amount=amount,
+        mode="remove",
+    )
+
+    await interaction.followup.send(
+        message,
+        ephemeral=True,
     )
 
 
