@@ -4547,14 +4547,42 @@ class QuestRewardSession:
             )
 
             if member is None:
-                skipped.append(
-                    (
-                        f"{recipient.display_name} "
-                        f"({recipient.slot}) "
-                        "is no longer in the server."
+                try:
+                    member = await self.guild.fetch_member(
+                        recipient.user_id
                     )
-                )
-                continue
+
+                except discord.NotFound:
+                    skipped.append(
+                        (
+                            f"{recipient.display_name} "
+                            f"({recipient.slot}) "
+                            "is no longer in the server."
+                        )
+                    )
+                    continue
+
+                except discord.Forbidden:
+                    skipped.append(
+                        (
+                            f"{recipient.display_name} "
+                            f"({recipient.slot}) "
+                            "could not be verified because Astrelius "
+                            "does not have permission to fetch that member."
+                        )
+                    )
+                    continue
+
+                except discord.HTTPException:
+                    skipped.append(
+                        (
+                            f"{recipient.display_name} "
+                            f"({recipient.slot}) "
+                            "could not be verified because Discord "
+                            "did not return the member information."
+                        )
+                    )
+                    continue
 
             async with (
                 db().acquire()
