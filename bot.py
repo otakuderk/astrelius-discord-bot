@@ -167,7 +167,6 @@ STAT_NAMES = (
 
 FACTION_ROLE_NAMES = (
     "Free Blade",
-    "White Flag",
     "Blighted",
     "Saviors",
     "Hysteria",
