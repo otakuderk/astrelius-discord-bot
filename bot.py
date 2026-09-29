@@ -1784,14 +1784,18 @@ async def build_inventory_embed(
 
 @bot.tree.command(
     name="inventory",
-    description="View your Main or Alt character inventory",
+    description="View a Main or Alt character inventory",
 )
 @app_commands.choices(
     slot=SLOTS
 )
+@app_commands.describe(
+    member="Player whose inventory you want to view",
+)
 async def inventory(
     interaction: discord.Interaction,
     slot: app_commands.Choice[str],
+    member: discord.Member | None = None,
 ):
     if interaction.guild_id is None:
         await interaction.response.send_message(
@@ -1804,9 +1808,15 @@ async def inventory(
         ephemeral=False
     )
 
+    target_member = (
+        member
+        if member is not None
+        else interaction.user
+    )
+
     embed, error = await build_inventory_embed(
         guild_id=interaction.guild_id,
-        member=interaction.user,
+        member=target_member,
         slot=slot.value,
     )
 
