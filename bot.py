@@ -356,13 +356,7 @@ def parse_proficiency_sections(
     *,
     dedicated_field: bool = False,
 ) -> list[str]:
-    """
-    Return only Armor, Weapons, Tools, and Languages proficiency entries.
-
-    If dedicated_field=True, the input is already the D&D Beyond
-    proficiencies/languages field, so flat entries are allowed even when
-    explicit section headers are missing.
-    """
+    """Return only Armor, Weapons, Tools, and Languages proficiency entries."""
     allowed_headers = {"ARMOR", "WEAPONS", "TOOLS", "LANGUAGES"}
     stop_headers = {
         "ACTIONS",
@@ -385,7 +379,7 @@ def parse_proficiency_sections(
     current_section: str | None = None
 
     for raw_line in text.splitlines():
-        line = raw_line.strip().lstrip("•*- ").strip()
+        line = raw_line.strip().lstrip("•*- " ).strip()
 
         if not line:
             continue
@@ -406,29 +400,6 @@ def parse_proficiency_sections(
         if not dedicated_field and current_section not in allowed_headers:
             continue
 
-        # In a dedicated proficiency field, still ignore obvious non-proficiency
-        # labels if D&D Beyond appends extra sheet text.
-        if dedicated_field:
-            upper = line.upper()
-            if any(
-                upper.startswith(prefix)
-                for prefix in (
-                    "SPEED",
-                    "WALKING",
-                    "CLIMBING",
-                    "FLYING",
-                    "SWIMMING",
-                    "HIT POINT",
-                    "ARMOR CLASS",
-                    "INITIATIVE",
-                    "PROFICIENCY BONUS",
-                    "PASSIVE ",
-                    "SAVING THROWS",
-                    "SKILLS",
-                )
-            ):
-                continue
-
         if not re.search(r"[A-Za-z0-9]", line):
             continue
 
@@ -447,73 +418,37 @@ def parse_proficiency_sections(
     return proficiencies
 
 
-def extract_stats_from_form_fields(
-    fields: dict[str, str],
-) -> dict[str, int]:
-    """
-    Recover ability scores from varied D&D Beyond PDF form-field names.
-    We strongly prefer fields whose names contain an ability name/abbreviation
-    plus 'score' or 'ability'. Modifier-like values are ignored.
-    """
-    aliases = {
-        "Strength": ("strength", "str"),
-        "Dexterity": ("dexterity", "dex"),
-        "Constitution": ("constitution", "con"),
-        "Intelligence": ("intelligence", "int"),
-        "Wisdom": ("wisdom", "wis"),
-        "Charisma": ("charisma", "cha"),
-    }
+def pdf_text_with_ocr_fallback(document: fitz.Document) -> str:
+    """Read normal PDF text first, then OCR the pages if the text layer is too thin."""
+    text = "\n".join(
+        page.get_text("text")
+        for page in document
+    )
 
-    normalized = {
-        normalize_field_name(key): str(value).strip()
-        for key, value in fields.items()
-    }
+    if len(text.strip()) >= 100:
+        return text
 
-    stats: dict[str, int] = {}
+    pages: list[str] = []
 
-    for stat_name, stat_aliases in aliases.items():
-        candidates: list[tuple[int, str]] = []
+    for page in document:
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(2, 2),
+            alpha=False,
+        )
 
-        for field_name, value in normalized.items():
-            if not value:
-                continue
-
-            alias_hit = any(
-                alias in field_name
-                for alias in stat_aliases
+        image = Image.open(
+            io.BytesIO(
+                pix.tobytes("png")
             )
+        )
 
-            if not alias_hit:
-                continue
+        pages.append(
+            pytesseract.image_to_string(image)
+        )
 
-            priority = 10
+    ocr_text = "\n".join(pages)
 
-            if "score" in field_name:
-                priority = 0
-            elif "ability" in field_name:
-                priority = 1
-            elif field_name in stat_aliases:
-                priority = 5
-
-            candidates.append((priority, value))
-
-        for _, value in sorted(candidates, key=lambda item: item[0]):
-            match = re.search(
-                r"(?<![+\-])\b([1-9]|[12][0-9]|30)\b",
-                value,
-            )
-
-            if not match:
-                continue
-
-            score = int(match.group(1))
-
-            # Ignore modifier-like values such as 2, 3, 4, 5.
-            if 6 <= score <= 30:
-                stats[stat_name] = score
-                break
-
-    return stats
+    return ocr_text if ocr_text.strip() else text
 
 
 # =========================================================
@@ -662,18 +597,10 @@ def extract_sheet(
     attachment: discord.Attachment,
     payload: bytes,
 ) -> SheetData:
-    filename = (
-        attachment.filename.casefold()
-    )
+    filename = attachment.filename.casefold()
+    content_type = (attachment.content_type or "").casefold()
 
-    content_type = (
-        attachment.content_type or ""
-    ).casefold()
-
-    if (
-        filename.endswith(".pdf")
-        or content_type == "application/pdf"
-    ):
+    if filename.endswith(".pdf") or content_type == "application/pdf":
         document = fitz.open(
             stream=payload,
             filetype="pdf",
@@ -686,220 +613,128 @@ def extract_sheet(
 
             if widgets:
                 for widget in widgets:
-                    if (
-                        widget.field_name
-                        and widget.field_value is not None
-                    ):
-                        fields[
-                            widget.field_name
-                        ] = str(
-                            widget.field_value
-                        ).strip()
+                    if widget.field_name and widget.field_value is not None:
+                        fields[widget.field_name] = str(widget.field_value).strip()
 
-        if fields:
-            log.info(
-                "D&D Beyond PDF form fields detected: %s",
-                list(fields.keys()),
-            )
+        # Always build a fallback parse from the visible sheet.
+        # This is important because some D&D Beyond PDFs contain form widgets
+        # but do not expose useful ability scores through those widgets.
+        visible_text = pdf_text_with_ocr_fallback(document)
+        fallback = parse_sheet_text(visible_text)
 
-            stats = extract_stats_from_form_fields(fields)
+        if not fields:
+            return fallback
 
-            name = find_form_field(
-                fields,
-                "CharacterName",
-                "Character Name",
-            ) or None
-
-            # -------------------------------------------------
-            # CLASS
-            #
-            # D&D Beyond PDFs can vary slightly in field naming.
-            # We normalize the field names before looking them up.
-            #
-            # IMPORTANT: We strip the sheet level off and never
-            # use it for server progression.
-            # -------------------------------------------------
-
-            class_name = None
-
-            class_level = find_form_field(
-                fields,
-                "CLASS LEVEL",
-                "Class Level",
-                "ClassLevel",
-                "Class & Level",
-            )
-
-            if class_level:
-                class_name = re.sub(
-                    r"\s+\d{1,2}\s*$",
-                    "",
-                    class_level,
-                ).strip() or None
-
-            # -------------------------------------------------
-            # SUBCLASS
-            # -------------------------------------------------
-
-            subclass_name = None
-
-            features_text = " ".join(
-                value
-                for key, value in fields.items()
-                if "feature" in key.casefold()
-                or "trait" in key.casefold()
-            )
-
-            subclass_match = re.search(
-                r"\b([A-Za-z][A-Za-z '\-]*)"
-                r"\s+Subclass\b"
-                r"[^|]{0,150}\|"
-                r"\s*([^*|\n]+)",
-                features_text,
-                re.I,
-            )
-
-            if subclass_match:
-                # If class field failed, recover the class
-                # from "Wizard Subclass ..."
-                if not class_name:
-                    class_name = (
-                        subclass_match
-                        .group(1)
-                        .strip()
-                    )
-
-                subclass_name = (
-                    subclass_match
-                    .group(2)
-                    .strip()
-                )
-
-            # -------------------------------------------------
-            # PROFICIENCIES
-            # -------------------------------------------------
-
-            training = find_form_field(
-                fields,
-                "ProficienciesLang",
-                "Proficiencies Lang",
-                "Proficiencies & Languages",
-                "Proficiencies & Training",
-            )
-
-            proficiencies = (
-                parse_proficiency_sections(
-                    training,
-                    dedicated_field=True,
-                )
-                if training
-                else []
-            )
-
-            log.info(
-                "Parsed sheet class=%r subclass=%r",
-                class_name,
-                subclass_name,
-            )
-
-            # Also read the PDF text layer. Some D&D Beyond exports expose
-            # modifiers in the form fields but place the real scores in text.
-            text = "\n".join(
-                page.get_text("text")
-                for page in document
-            )
-
-            fallback = (
-                parse_sheet_text(text)
-                if text.strip()
-                else SheetData(
-                    name=None,
-                    class_name=None,
-                    subclass_name=None,
-                    stats={},
-                    proficiencies=[],
-                )
-            )
-
-            merged_stats = dict(fallback.stats)
-            merged_stats.update(stats)
-
-            merged_proficiencies = (
-                proficiencies
-                if proficiencies
-                else fallback.proficiencies
-            )
-
-            return SheetData(
-                name=name or fallback.name,
-                class_name=class_name or fallback.class_name,
-                subclass_name=subclass_name or fallback.subclass_name,
-                stats=merged_stats,
-                proficiencies=merged_proficiencies,
-            )
-
-        # PDF without useful form fields
-        text = "\n".join(
-            page.get_text("text")
-            for page in document
+        log.info(
+            "D&D Beyond PDF form fields detected: %s",
+            list(fields.keys()),
         )
 
-        if len(text.strip()) < 100:
-            pages: list[str] = []
+        stats: dict[str, int] = {}
+        field_to_stat = {
+            "STR": "Strength",
+            "DEX": "Dexterity",
+            "CON": "Constitution",
+            "INT": "Intelligence",
+            "WIS": "Wisdom",
+            "CHA": "Charisma",
+        }
 
-            for page in document:
-                pix = page.get_pixmap(
-                    matrix=fitz.Matrix(
-                        2,
-                        2,
-                    ),
-                    alpha=False,
-                )
-
-                image = Image.open(
-                    io.BytesIO(
-                        pix.tobytes("png")
-                    )
-                )
-
-                pages.append(
-                    pytesseract.image_to_string(
-                        image
-                    )
-                )
-
-            text = "\n".join(
-                pages
+        # Only trust a form-field value when it looks like a real ability score.
+        for field_name, stat_name in field_to_stat.items():
+            value = find_form_field(
+                fields,
+                f"{field_name} Score",
+                f"{field_name}Score",
+                f"{stat_name} Score",
+                stat_name,
+                field_name,
             )
 
-        return parse_sheet_text(
-            text
+            if not value:
+                continue
+
+            numbers = re.findall(r"(?<![+\-])\b([1-9]|[12][0-9]|30)\b", value)
+
+            for number in numbers:
+                score = int(number)
+                if 6 <= score <= 30:
+                    stats[stat_name] = score
+                    break
+
+        name = find_form_field(
+            fields,
+            "CharacterName",
+            "Character Name",
+        ) or fallback.name
+
+        class_name = fallback.class_name
+        class_level = find_form_field(
+            fields,
+            "CLASS LEVEL",
+            "Class Level",
+            "ClassLevel",
+            "Class & Level",
+        )
+
+        if class_level:
+            class_name = re.sub(
+                r"\s+\d{1,2}\s*$",
+                "",
+                class_level,
+            ).strip() or class_name
+
+        subclass_name = fallback.subclass_name
+
+        training = find_form_field(
+            fields,
+            "ProficienciesLang",
+            "Proficiencies Lang",
+            "Proficiencies & Languages",
+            "Proficiencies & Training",
+        )
+
+        proficiencies = (
+            parse_proficiency_sections(
+                training,
+                dedicated_field=True,
+            )
+            if training
+            else []
+        )
+
+        # Prefer trustworthy form values, but fill missing pieces from
+        # text/OCR so a weird PDF field layout does not make the import fail.
+        merged_stats = dict(fallback.stats)
+        merged_stats.update(stats)
+
+        merged_proficiencies = (
+            proficiencies
+            if proficiencies
+            else fallback.proficiencies
+        )
+
+        log.info(
+            "Parsed sheet stats=%r proficiencies=%r",
+            merged_stats,
+            merged_proficiencies,
+        )
+
+        return SheetData(
+            name=name,
+            class_name=class_name,
+            subclass_name=subclass_name,
+            stats=merged_stats,
+            proficiencies=merged_proficiencies,
         )
 
     if (
         content_type.startswith("image/")
-        or filename.endswith(
-            (
-                ".png",
-                ".jpg",
-                ".jpeg",
-                ".webp",
-            )
-        )
+        or filename.endswith((".png", ".jpg", ".jpeg", ".webp"))
     ):
-        image = Image.open(
-            io.BytesIO(payload)
-        )
-
-        text = (
-            pytesseract.image_to_string(
-                image
-            )
-        )
-
-        return parse_sheet_text(
-            text
-        )
+        image = Image.open(io.BytesIO(payload))
+        text = pytesseract.image_to_string(image)
+        return parse_sheet_text(text)
 
     raise ValueError(
         "Upload a PDF, PNG, JPG, or WebP file."
@@ -2274,8 +2109,8 @@ async def import_character_sheet(
         return (
             False,
             (
-                "I could not find any usable ability scores or proficiencies "
-                "in that file. Please use the PDF exported directly from D&D Beyond."
+                "I could not recognize character details. "
+                "Try the exported D&D Beyond PDF."
             ),
         )
 
