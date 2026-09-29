@@ -375,12 +375,16 @@ def parse_proficiency_sections(text: str) -> list[str]:
     current_section: str | None = None
 
     for raw_line in text.splitlines():
+        # D&D Beyond may prefix every line with a bullet. Remove it before
+        # testing for section headers such as "=== ARMOR ===".
         line = raw_line.strip()
+        line = line.lstrip("•-* " ).strip()
+
         if not line:
             continue
 
         header_match = re.fullmatch(
-            r"=?=?=?\s*([A-Za-z &]+?)\s*=?=?=?",
+            r"={0,3}\s*([A-Za-z &]+?)\s*={0,3}",
             line,
         )
 
@@ -402,11 +406,10 @@ def parse_proficiency_sections(text: str) -> list[str]:
         if current_section not in allowed_headers:
             continue
 
-        cleaned = line.lstrip("•-* ").strip()
-        if not cleaned:
+        if set(line) <= {"=", "-", "_"}:
             continue
 
-        for entry in re.split(r"[,;•]", cleaned):
+        for entry in re.split(r"[,;•]", line):
             entry = entry.strip(" •\t")
             if (
                 1 < len(entry) < 100
