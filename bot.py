@@ -172,6 +172,29 @@ FACTION_ROLE_NAMES = (
     "Hysteria",
 )
 
+CONQUEST_TERRITORIES = (
+    "Glacial Peaks",
+    "Dragonreach",
+    "Ferocious Dunes",
+    "War's Expanse",
+    "Leyline Grove",
+    "SunScar Plateau",
+    "Stromveil Coasts",
+)
+
+CONQUEST_REGION_CHOICES = [
+    app_commands.Choice(name=name, value=name)
+    for name in CONQUEST_TERRITORIES
+]
+
+CONQUEST_OWNER_CHOICES = [
+    app_commands.Choice(name="Unclaimed", value="Unclaimed"),
+    *[
+        app_commands.Choice(name=name, value=name)
+        for name in FACTION_ROLE_NAMES
+    ],
+]
+
 
 # =========================================================
 # PROGRESSION
@@ -990,6 +1013,21 @@ ADD COLUMN IF NOT EXISTS faction_points INTEGER NOT NULL DEFAULT 0 CHECK (
     faction_points >= 0
 );
 
+CREATE TABLE IF NOT EXISTS conquest_territories (
+    guild_id BIGINT NOT NULL,
+    territory_name TEXT NOT NULL,
+    owner_faction TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (guild_id, territory_name)
+);
+
+CREATE TABLE IF NOT EXISTS conquest_map_messages (
+    guild_id BIGINT PRIMARY KEY,
+    channel_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 CREATE TABLE IF NOT EXISTS auctions (
     auction_id BIGSERIAL PRIMARY KEY,
 
@@ -1457,6 +1495,11 @@ materials_group = app_commands.Group(
 faction_points_group = app_commands.Group(
     name="factionpoints",
     description="DM/GM faction point management",
+)
+
+conquest_group = app_commands.Group(
+    name="conquest",
+    description="DM/GM conquest map management",
 )
 
 
@@ -7241,6 +7284,327 @@ async def faction_points_remove(
 
 
 
+
+# =========================================================
+# CONQUEST MAP
+# =========================================================
+
+async def conquest_ownership(
+    guild_id: int,
+) -> dict[str, str | None]:
+    rows = await db().fetch(
+        """
+        SELECT territory_name, owner_faction
+        FROM conquest_territories
+        WHERE guild_id=$1
+        """,
+        guild_id,
+    )
+
+    ownership = {
+        territory: None
+        for territory in CONQUEST_TERRITORIES
+    }
+
+    for row in rows:
+        territory_name = str(row["territory_name"])
+        if territory_name in ownership:
+            ownership[territory_name] = row["owner_faction"]
+
+    return ownership
+
+
+def conquest_summary_embed(
+    ownership: dict[str, str | None],
+) -> discord.Embed:
+    lines = [
+        (
+            f"**{territory}:** "
+            f"{ownership.get(territory) or 'Unclaimed'}"
+        )
+        for territory in CONQUEST_TERRITORIES
+    ]
+
+    embed = discord.Embed(
+        title="🗺️ Conquest Map",
+        description="\n".join(lines),
+        color=discord.Color.red(),
+    )
+
+    embed.set_footer(
+        text="Map image and colored territory overlays will be added next."
+    )
+
+    return embed
+
+
+async def refresh_conquest_board(
+    guild: discord.Guild,
+) -> bool:
+    row = await db().fetchrow(
+        """
+        SELECT channel_id, message_id
+        FROM conquest_map_messages
+        WHERE guild_id=$1
+        """,
+        guild.id,
+    )
+
+    if not row:
+        return False
+
+    channel = guild.get_channel(int(row["channel_id"]))
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(
+                int(row["channel_id"])
+            )
+        except discord.HTTPException:
+            return False
+
+    try:
+        message = await channel.fetch_message(
+            int(row["message_id"])
+        )
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException,
+    ):
+        return False
+
+    ownership = await conquest_ownership(
+        guild.id
+    )
+
+    await message.edit(
+        embed=conquest_summary_embed(
+            ownership
+        )
+    )
+
+    return True
+
+
+@conquest_group.command(
+    name="post",
+    description="Post or replace the public Conquest Map board",
+)
+@app_commands.check(staff_check)
+async def conquest_post(
+    interaction: discord.Interaction,
+):
+    if (
+        interaction.guild is None
+        or interaction.channel is None
+    ):
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    ownership = await conquest_ownership(
+        interaction.guild.id
+    )
+
+    message = await interaction.channel.send(
+        embed=conquest_summary_embed(
+            ownership
+        )
+    )
+
+    await db().execute(
+        """
+        INSERT INTO conquest_map_messages (
+            guild_id,
+            channel_id,
+            message_id,
+            updated_at
+        )
+        VALUES ($1, $2, $3, now())
+
+        ON CONFLICT (guild_id)
+        DO UPDATE SET
+            channel_id=EXCLUDED.channel_id,
+            message_id=EXCLUDED.message_id,
+            updated_at=now()
+        """,
+        interaction.guild.id,
+        interaction.channel.id,
+        message.id,
+    )
+
+    await interaction.followup.send(
+        "Conquest Map board posted and linked to this channel.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="region",
+    description="Set who owns a conquest region",
+)
+@app_commands.check(staff_check)
+@app_commands.choices(
+    region=CONQUEST_REGION_CHOICES,
+    owner=CONQUEST_OWNER_CHOICES,
+)
+async def region_command(
+    interaction: discord.Interaction,
+    region: app_commands.Choice[str],
+    owner: app_commands.Choice[str],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    owner_value = (
+        None
+        if owner.value == "Unclaimed"
+        else owner.value
+    )
+
+    if owner_value is not None:
+        role = discord.utils.get(
+            interaction.guild.roles,
+            name=owner_value,
+        )
+
+        if role is None:
+            await interaction.response.send_message(
+                (
+                    f"The faction role `{owner_value}` does not exist. "
+                    "Create that exact Discord role first."
+                ),
+                ephemeral=True,
+            )
+            return
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    await db().execute(
+        """
+        INSERT INTO conquest_territories (
+            guild_id,
+            territory_name,
+            owner_faction,
+            updated_at
+        )
+        VALUES ($1, $2, $3, now())
+
+        ON CONFLICT (
+            guild_id,
+            territory_name
+        )
+        DO UPDATE SET
+            owner_faction=EXCLUDED.owner_faction,
+            updated_at=now()
+        """,
+        interaction.guild.id,
+        region.value,
+        owner_value,
+    )
+
+    refreshed = await refresh_conquest_board(
+        interaction.guild
+    )
+
+    message = (
+        f"**{region.value}** is now owned by "
+        f"**{owner_value or 'Unclaimed'}**."
+    )
+
+    if not refreshed:
+        message += (
+            "\nOwnership was saved, but no Conquest Map board is linked yet. "
+            "Run `/conquest post` in the map channel."
+        )
+
+    await interaction.followup.send(
+        message,
+        ephemeral=True,
+    )
+
+
+@conquest_group.command(
+    name="reset",
+    description="Reset all conquest regions to unclaimed",
+)
+@app_commands.check(staff_check)
+async def conquest_reset(
+    interaction: discord.Interaction,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    async with db().acquire() as connection:
+        async with connection.transaction():
+            for territory_name in CONQUEST_TERRITORIES:
+                await connection.execute(
+                    """
+                    INSERT INTO conquest_territories (
+                        guild_id,
+                        territory_name,
+                        owner_faction,
+                        updated_at
+                    )
+                    VALUES ($1, $2, NULL, now())
+
+                    ON CONFLICT (
+                        guild_id,
+                        territory_name
+                    )
+                    DO UPDATE SET
+                        owner_faction=NULL,
+                        updated_at=now()
+                    """,
+                    interaction.guild.id,
+                    territory_name,
+                )
+
+    refreshed = await refresh_conquest_board(
+        interaction.guild
+    )
+
+    message = (
+        "🗺️ **Conquest map reset.**\n"
+        "All 7 territories are now **Unclaimed**."
+    )
+
+    if not refreshed:
+        message += (
+            "\nNo Conquest Map board is linked yet. "
+            "Run `/conquest post` in the map channel."
+        )
+
+    await interaction.followup.send(
+        message,
+        ephemeral=True,
+    )
+
+
 # =========================================================
 # REGISTER GROUPS
 # =========================================================
@@ -7254,6 +7618,7 @@ for group in (
     gold_group,
     materials_group,
     faction_points_group,
+    conquest_group,
 ):
     bot.tree.add_command(
         group
