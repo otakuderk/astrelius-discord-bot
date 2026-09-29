@@ -7216,6 +7216,7 @@ for group in (
     level_group,
     gold_group,
     materials_group,
+    faction_points_group,
 ):
     bot.tree.add_command(
         group
