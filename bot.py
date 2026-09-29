@@ -351,9 +351,17 @@ def find_form_field(
     return ""
 
 
-def parse_proficiency_sections(text: str) -> list[str]:
+def parse_proficiency_sections(
+    text: str,
+    *,
+    dedicated_field: bool = False,
+) -> list[str]:
     """
     Return only Armor, Weapons, Tools, and Languages proficiency entries.
+
+    If dedicated_field=True, the input is already the D&D Beyond
+    proficiencies/languages field, so flat entries are allowed even when
+    explicit section headers are missing.
     """
     allowed_headers = {"ARMOR", "WEAPONS", "TOOLS", "LANGUAGES"}
     stop_headers = {
@@ -395,24 +403,117 @@ def parse_proficiency_sections(text: str) -> list[str]:
             current_section = header_candidate
             continue
 
-        if current_section not in allowed_headers:
+        if not dedicated_field and current_section not in allowed_headers:
             continue
+
+        # In a dedicated proficiency field, still ignore obvious non-proficiency
+        # labels if D&D Beyond appends extra sheet text.
+        if dedicated_field:
+            upper = line.upper()
+            if any(
+                upper.startswith(prefix)
+                for prefix in (
+                    "SPEED",
+                    "WALKING",
+                    "CLIMBING",
+                    "FLYING",
+                    "SWIMMING",
+                    "HIT POINT",
+                    "ARMOR CLASS",
+                    "INITIATIVE",
+                    "PROFICIENCY BONUS",
+                    "PASSIVE ",
+                    "SAVING THROWS",
+                    "SKILLS",
+                )
+            ):
+                continue
 
         if not re.search(r"[A-Za-z0-9]", line):
             continue
 
         for entry in re.split(r"[,;•\n]", line):
             entry = entry.strip(" •*-\t")
+            upper_entry = entry.upper()
 
             if (
                 1 < len(entry) < 100
-                and entry.upper() not in allowed_headers
-                and entry.upper() not in stop_headers
+                and upper_entry not in allowed_headers
+                and upper_entry not in stop_headers
                 and entry not in proficiencies
             ):
                 proficiencies.append(entry)
 
     return proficiencies
+
+
+def extract_stats_from_form_fields(
+    fields: dict[str, str],
+) -> dict[str, int]:
+    """
+    Recover ability scores from varied D&D Beyond PDF form-field names.
+    We strongly prefer fields whose names contain an ability name/abbreviation
+    plus 'score' or 'ability'. Modifier-like values are ignored.
+    """
+    aliases = {
+        "Strength": ("strength", "str"),
+        "Dexterity": ("dexterity", "dex"),
+        "Constitution": ("constitution", "con"),
+        "Intelligence": ("intelligence", "int"),
+        "Wisdom": ("wisdom", "wis"),
+        "Charisma": ("charisma", "cha"),
+    }
+
+    normalized = {
+        normalize_field_name(key): str(value).strip()
+        for key, value in fields.items()
+    }
+
+    stats: dict[str, int] = {}
+
+    for stat_name, stat_aliases in aliases.items():
+        candidates: list[tuple[int, str]] = []
+
+        for field_name, value in normalized.items():
+            if not value:
+                continue
+
+            alias_hit = any(
+                alias in field_name
+                for alias in stat_aliases
+            )
+
+            if not alias_hit:
+                continue
+
+            priority = 10
+
+            if "score" in field_name:
+                priority = 0
+            elif "ability" in field_name:
+                priority = 1
+            elif field_name in stat_aliases:
+                priority = 5
+
+            candidates.append((priority, value))
+
+        for _, value in sorted(candidates, key=lambda item: item[0]):
+            match = re.search(
+                r"(?<![+\-])\b([1-9]|[12][0-9]|30)\b",
+                value,
+            )
+
+            if not match:
+                continue
+
+            score = int(match.group(1))
+
+            # Ignore modifier-like values such as 2, 3, 4, 5.
+            if 6 <= score <= 30:
+                stats[stat_name] = score
+                break
+
+    return stats
 
 
 # =========================================================
@@ -601,58 +702,7 @@ def extract_sheet(
                 list(fields.keys()),
             )
 
-            stats: dict[str, int] = {}
-
-            field_to_stat = {
-                "STR": "Strength",
-                "DEX": "Dexterity",
-                "CON": "Constitution",
-                "INT": "Intelligence",
-                "WIS": "Wisdom",
-                "CHA": "Charisma",
-            }
-
-            for field_name, stat_name in field_to_stat.items():
-                score = None
-
-                value = find_form_field(
-                    fields,
-                    f"{field_name} Score",
-                    f"{field_name}Score",
-                    f"{stat_name} Score",
-                    stat_name,
-                )
-
-                if value:
-                    try:
-                        parsed_value = int(
-                            re.sub(r"[^0-9\-]", "", value)
-                        )
-
-                        if 6 <= parsed_value <= 30:
-                            score = parsed_value
-                    except ValueError:
-                        pass
-
-                if score is None:
-                    short_value = find_form_field(
-                        fields,
-                        field_name,
-                    )
-
-                    if short_value:
-                        try:
-                            parsed_value = int(
-                                re.sub(r"[^0-9\-]", "", short_value)
-                            )
-
-                            if 6 <= parsed_value <= 30:
-                                score = parsed_value
-                        except ValueError:
-                            pass
-
-                if score is not None:
-                    stats[stat_name] = score
+            stats = extract_stats_from_form_fields(fields)
 
             name = find_form_field(
                 fields,
@@ -738,7 +788,10 @@ def extract_sheet(
             )
 
             proficiencies = (
-                parse_proficiency_sections(training)
+                parse_proficiency_sections(
+                    training,
+                    dedicated_field=True,
+                )
                 if training
                 else []
             )
@@ -749,12 +802,40 @@ def extract_sheet(
                 subclass_name,
             )
 
+            # Also read the PDF text layer. Some D&D Beyond exports expose
+            # modifiers in the form fields but place the real scores in text.
+            text = "\n".join(
+                page.get_text("text")
+                for page in document
+            )
+
+            fallback = (
+                parse_sheet_text(text)
+                if text.strip()
+                else SheetData(
+                    name=None,
+                    class_name=None,
+                    subclass_name=None,
+                    stats={},
+                    proficiencies=[],
+                )
+            )
+
+            merged_stats = dict(fallback.stats)
+            merged_stats.update(stats)
+
+            merged_proficiencies = (
+                proficiencies
+                if proficiencies
+                else fallback.proficiencies
+            )
+
             return SheetData(
-                name=name,
-                class_name=class_name,
-                subclass_name=subclass_name,
-                stats=stats,
-                proficiencies=proficiencies,
+                name=name or fallback.name,
+                class_name=class_name or fallback.class_name,
+                subclass_name=subclass_name or fallback.subclass_name,
+                stats=merged_stats,
+                proficiencies=merged_proficiencies,
             )
 
         # PDF without useful form fields
@@ -2193,8 +2274,8 @@ async def import_character_sheet(
         return (
             False,
             (
-                "I could not recognize character details. "
-                "Try the exported D&D Beyond PDF."
+                "I could not find any usable ability scores or proficiencies "
+                "in that file. Please use the PDF exported directly from D&D Beyond."
             ),
         )
 
