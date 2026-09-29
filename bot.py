@@ -352,7 +352,9 @@ def find_form_field(
 
 
 def parse_proficiency_sections(text: str) -> list[str]:
-    """Return only armor, weapon, tool, and language proficiency entries."""
+    """
+    Return only Armor, Weapons, Tools, and Languages proficiency entries.
+    """
     allowed_headers = {"ARMOR", "WEAPONS", "TOOLS", "LANGUAGES"}
     stop_headers = {
         "ACTIONS",
@@ -375,44 +377,37 @@ def parse_proficiency_sections(text: str) -> list[str]:
     current_section: str | None = None
 
     for raw_line in text.splitlines():
-        # D&D Beyond may prefix every line with a bullet. Remove it before
-        # testing for section headers such as "=== ARMOR ===".
-        line = raw_line.strip()
-        line = line.lstrip("•-* " ).strip()
+        line = raw_line.strip().lstrip("•*- ").strip()
 
         if not line:
             continue
 
-        header_match = re.fullmatch(
-            r"={0,3}\s*([A-Za-z &]+?)\s*={0,3}",
+        header_candidate = re.sub(
+            r"^[=\s]+|[=\s]+$",
+            "",
             line,
-        )
+        ).strip().upper()
 
-        if header_match:
-            header = re.sub(
-                r"\s+",
-                " ",
-                header_match.group(1).strip().upper(),
-            )
+        if header_candidate in stop_headers:
+            break
 
-            if header in stop_headers:
-                current_section = None
-                break
-
-            if header in allowed_headers:
-                current_section = header
-                continue
+        if header_candidate in allowed_headers:
+            current_section = header_candidate
+            continue
 
         if current_section not in allowed_headers:
             continue
 
-        if set(line) <= {"=", "-", "_"}:
+        if not re.search(r"[A-Za-z0-9]", line):
             continue
 
-        for entry in re.split(r"[,;•]", line):
-            entry = entry.strip(" •\t")
+        for entry in re.split(r"[,;•\n]", line):
+            entry = entry.strip(" •*-\t")
+
             if (
                 1 < len(entry) < 100
+                and entry.upper() not in allowed_headers
+                and entry.upper() not in stop_headers
                 and entry not in proficiencies
             ):
                 proficiencies.append(entry)
@@ -453,25 +448,29 @@ def parse_sheet_text(
                 or upper.startswith(alias + " ")
                 for alias in aliases
             ):
-                numbers = re.findall(
-                    r"\b([1-9]|[12][0-9]|30)\b",
-                    line,
-                )
+                score = None
 
-                if not numbers:
-                    for next_line in lines[i + 1:i + 4]:
-                        numbers = re.findall(
-                            r"\b([1-9]|[12][0-9]|30)\b",
-                            next_line,
+                for candidate_line in [line, *lines[i + 1:i + 4]]:
+                    numbers = [
+                        int(value)
+                        for value in re.findall(
+                            r"(?<![+\-])\b([1-9]|[12][0-9]|30)\b",
+                            candidate_line,
                         )
+                    ]
 
-                        if numbers:
-                            break
+                    plausible_scores = [
+                        value
+                        for value in numbers
+                        if 6 <= value <= 30
+                    ]
 
-                if numbers:
-                    stats[full_name] = int(
-                        numbers[0]
-                    )
+                    if plausible_scores:
+                        score = plausible_scores[0]
+                        break
+
+                if score is not None:
+                    stats[full_name] = score
                     break
 
     name = None
@@ -613,26 +612,47 @@ def extract_sheet(
                 "CHA": "Charisma",
             }
 
-            for (
-                field_name,
-                stat_name,
-            ) in field_to_stat.items():
+            for field_name, stat_name in field_to_stat.items():
+                score = None
+
                 value = find_form_field(
                     fields,
-                    field_name,
+                    f"{field_name} Score",
+                    f"{field_name}Score",
+                    f"{stat_name} Score",
+                    stat_name,
                 )
 
                 if value:
                     try:
-                        score = int(value)
+                        parsed_value = int(
+                            re.sub(r"[^0-9\-]", "", value)
+                        )
 
-                        if 1 <= score <= 30:
-                            stats[
-                                stat_name
-                            ] = score
-
+                        if 6 <= parsed_value <= 30:
+                            score = parsed_value
                     except ValueError:
                         pass
+
+                if score is None:
+                    short_value = find_form_field(
+                        fields,
+                        field_name,
+                    )
+
+                    if short_value:
+                        try:
+                            parsed_value = int(
+                                re.sub(r"[^0-9\-]", "", short_value)
+                            )
+
+                            if 6 <= parsed_value <= 30:
+                                score = parsed_value
+                        except ValueError:
+                            pass
+
+                if score is not None:
+                    stats[stat_name] = score
 
             name = find_form_field(
                 fields,
@@ -2179,7 +2199,19 @@ async def import_character_sheet(
         )
 
     # Sheet imports intentionally update only stats and proficiencies.
-    # Character name, class, subclass, progression, and economy are preserved.
+    # If one section fails to parse, preserve the previous good data.
+    stats_to_save = (
+        parsed.stats
+        if parsed.stats
+        else dict(existing["stats"])
+    )
+
+    proficiencies_to_save = (
+        parsed.proficiencies
+        if parsed.proficiencies
+        else list(existing["proficiencies"])
+    )
+
     await db().execute(
         """
         UPDATE characters
@@ -2190,8 +2222,8 @@ async def import_character_sheet(
         AND user_id=$4
         AND slot=$5
         """,
-        parsed.stats,
-        parsed.proficiencies,
+        stats_to_save,
+        proficiencies_to_save,
         guild_id,
         user_id,
         slot,
