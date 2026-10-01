@@ -91,8 +91,8 @@ TRAINING_TYPE_CHOICES = [
         value="Language",
     ),
     app_commands.Choice(
-        name="Tool Proficiency Retraining (100 Gold/week, 15 weeks)",
-        value="Tool Proficiency Retraining",
+        name="Tool Proficiency Training (100 Gold/week, 15 weeks)",
+        value="Tool Proficiency Training",
     ),
     app_commands.Choice(
         name="Feat Retraining (125 Gold/week, 20 weeks)",
@@ -105,7 +105,7 @@ TRAINING_RULES = {
         "cost": 25,
         "weeks": 10,
     },
-    "Tool Proficiency Retraining": {
+    "Tool Proficiency Training": {
         "cost": 100,
         "weeks": 15,
     },
@@ -1116,6 +1116,10 @@ WHERE training_type='Language / Proficiency';
 UPDATE characters
 SET training_type='Feat Retraining'
 WHERE training_type='Feat';
+
+UPDATE characters
+SET training_type='Tool Proficiency Training'
+WHERE training_type='Tool Proficiency Retraining';
 
 ALTER TABLE characters
 ADD COLUMN IF NOT EXISTS faction TEXT;
@@ -4115,9 +4119,9 @@ class TrainingStartView(discord.ui.View):
                     value="Language",
                 ),
                 discord.SelectOption(
-                    label="Tool Proficiency Retraining",
+                    label="Tool Proficiency Training",
                     description="100 Gold/week • 15 weeks",
-                    value="Tool Proficiency Retraining",
+                    value="Tool Proficiency Training",
                 ),
                 discord.SelectOption(
                     label="Feat Retraining",
