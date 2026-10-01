@@ -87,23 +87,31 @@ JOB_DC = 16
 
 TRAINING_TYPE_CHOICES = [
     app_commands.Choice(
-        name="Language / Proficiency (50 Gold, 10 weeks)",
-        value="Language / Proficiency",
+        name="Language (25 Gold/week, 10 weeks)",
+        value="Language",
     ),
     app_commands.Choice(
-        name="Feat (200 Gold, 15 weeks)",
-        value="Feat",
+        name="Tool Proficiency Retraining (100 Gold/week, 15 weeks)",
+        value="Tool Proficiency Retraining",
+    ),
+    app_commands.Choice(
+        name="Feat Retraining (125 Gold/week, 20 weeks)",
+        value="Feat Retraining",
     ),
 ]
 
 TRAINING_RULES = {
-    "Language / Proficiency": {
-        "cost": 50,
+    "Language": {
+        "cost": 25,
         "weeks": 10,
     },
-    "Feat": {
-        "cost": 200,
+    "Tool Proficiency Retraining": {
+        "cost": 100,
         "weeks": 15,
+    },
+    "Feat Retraining": {
+        "cost": 125,
+        "weeks": 20,
     },
 }
 
@@ -1065,7 +1073,7 @@ CREATE TABLE IF NOT EXISTS characters (
     training_name TEXT,
     training_type TEXT,
     training_week SMALLINT NOT NULL DEFAULT 0 CHECK (
-        training_week BETWEEN 0 AND 15
+        training_week BETWEEN 0 AND 20
     ),
 
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -1091,6 +1099,23 @@ ADD COLUMN IF NOT EXISTS training_type TEXT;
 
 ALTER TABLE characters
 ADD COLUMN IF NOT EXISTS training_week SMALLINT NOT NULL DEFAULT 0;
+
+-- Expand the training progress limit for the new 20-week feat retraining.
+ALTER TABLE characters
+DROP CONSTRAINT IF EXISTS characters_training_week_check;
+
+ALTER TABLE characters
+ADD CONSTRAINT characters_training_week_check
+CHECK (training_week BETWEEN 0 AND 20);
+
+-- Migrate active training records from the previous training names.
+UPDATE characters
+SET training_type='Language'
+WHERE training_type='Language / Proficiency';
+
+UPDATE characters
+SET training_type='Feat Retraining'
+WHERE training_type='Feat';
 
 ALTER TABLE characters
 ADD COLUMN IF NOT EXISTS faction TEXT;
@@ -3576,7 +3601,7 @@ class TrainingConfirmView(discord.ui.View):
                 name="Finished",
                 value=(
                     "The bot has cleared the active training record. "
-                    "Add the completed language, proficiency, or feat to your "
+                    "Add the completed language, tool proficiency, or feat to your "
                     "D&D Beyond sheet yourself."
                 ),
                 inline=False,
@@ -4085,14 +4110,19 @@ class TrainingStartView(discord.ui.View):
             max_values=1,
             options=[
                 discord.SelectOption(
-                    label="Language / Proficiency",
-                    description="50 Gold • 10 weeks",
-                    value="Language / Proficiency",
+                    label="Language",
+                    description="25 Gold/week • 10 weeks",
+                    value="Language",
                 ),
                 discord.SelectOption(
-                    label="Feat",
-                    description="200 Gold • 15 weeks",
-                    value="Feat",
+                    label="Tool Proficiency Retraining",
+                    description="100 Gold/week • 15 weeks",
+                    value="Tool Proficiency Retraining",
+                ),
+                discord.SelectOption(
+                    label="Feat Retraining",
+                    description="125 Gold/week • 20 weeks",
+                    value="Feat Retraining",
                 ),
             ],
             row=1,
@@ -4412,7 +4442,7 @@ async def trainingboard_command(
 ):
     embed = discord.Embed(
         title="📚 Astrelius Training",
-        description="Train languages, proficiencies, or replace a feat.",
+        description="Train languages, retrain tool proficiencies, or retrain feats.",
         color=discord.Color.gold(),
     )
 
