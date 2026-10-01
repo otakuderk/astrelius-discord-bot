@@ -8,6 +8,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Literal
 
 import asyncpg
@@ -171,6 +172,62 @@ FACTION_ROLE_NAMES = (
     "Saviors",
     "Hysteria",
 )
+
+# =========================================================
+# CONQUEST
+# =========================================================
+
+CONQUEST_TERRITORIES = (
+    "Glacial Peaks",
+    "Dragonreach",
+    "Ferocious Dunes",
+    "War's Expanse",
+    "Leyline Grove",
+    "SunScar Plateau",
+    "Stromveil Coasts",
+)
+
+CONQUEST_REGION_FILES = {
+    "Glacial Peaks": "glacialpeaks.png",
+    "Dragonreach": "dragonreach.png",
+    "Ferocious Dunes": "ferociousdunes.png",
+    "War's Expanse": "warsexpanse.png",
+    "Leyline Grove": "leylinegrove.png",
+    "SunScar Plateau": "sunscarplateau.png",
+    "Stromveil Coasts": "stormveilcoasts.png",
+}
+
+# The newer white/red base map is preferred. The second filename is accepted
+# too so a harmless rename in GitHub does not break the bot again.
+CONQUEST_BASE_FILENAMES = (
+    "conquestmapwhite.png",
+    "conquestmap.png",
+)
+
+CONQUEST_IMAGE_DIR = (
+    Path(__file__).resolve().parent / "conquestimages"
+)
+
+CONQUEST_REGION_CHOICES = [
+    app_commands.Choice(name=name, value=name)
+    for name in CONQUEST_TERRITORIES
+]
+
+CONQUEST_OWNER_CHOICES = [
+    app_commands.Choice(name="Unclaimed", value="Unclaimed"),
+    *[
+        app_commands.Choice(name=name, value=name)
+        for name in FACTION_ROLE_NAMES
+    ],
+]
+
+# Used only if a Discord faction role has no role color set.
+CONQUEST_FALLBACK_COLORS = {
+    "Free Blade": (0, 0, 0),
+    "Blighted": (35, 155, 86),
+    "Saviors": (245, 215, 110),
+    "Hysteria": (36, 116, 166),
+}
 
 # =========================================================
 # PROGRESSION
@@ -1124,6 +1181,23 @@ ON auction_bids (
     bidder_user_id,
     bidder_slot
 );
+
+-- Fresh conquest tables. These intentionally use v2 names so any abandoned
+-- conquest prototype data cannot leak into the rebuilt system.
+CREATE TABLE IF NOT EXISTS conquest_regions_v2 (
+    guild_id BIGINT NOT NULL,
+    territory_name TEXT NOT NULL,
+    owner_faction TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (guild_id, territory_name)
+);
+
+CREATE TABLE IF NOT EXISTS conquest_board_v2 (
+    guild_id BIGINT PRIMARY KEY,
+    channel_id BIGINT NOT NULL,
+    message_id BIGINT NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 """
 
 
@@ -1510,6 +1584,11 @@ materials_group = app_commands.Group(
 faction_points_group = app_commands.Group(
     name="factionpoints",
     description="DM/GM faction point management",
+)
+
+conquest_group = app_commands.Group(
+    name="conquest",
+    description="DM/GM conquest map management",
 )
 
 
@@ -7290,6 +7369,568 @@ async def faction_points_remove(
 
 
 # =========================================================
+# CONQUEST MAP
+# =========================================================
+
+def conquest_base_map_path() -> Path | None:
+    for filename in CONQUEST_BASE_FILENAMES:
+        path = CONQUEST_IMAGE_DIR / filename
+        if path.is_file():
+            return path
+    return None
+
+
+def conquest_assets_error() -> str | None:
+    if not CONQUEST_IMAGE_DIR.is_dir():
+        return (
+            "The conquest image folder is missing. Expected: "
+            "`conquestimages/` beside `bot.py`."
+        )
+
+    base_path = conquest_base_map_path()
+    if base_path is None:
+        expected = " or ".join(
+            f"`conquestimages/{name}`"
+            for name in CONQUEST_BASE_FILENAMES
+        )
+        return f"The conquest base map is missing. Expected {expected}."
+
+    missing = [
+        filename
+        for filename in CONQUEST_REGION_FILES.values()
+        if not (CONQUEST_IMAGE_DIR / filename).is_file()
+    ]
+
+    if missing:
+        return (
+            "The conquest map is missing these region image(s):\n"
+            + "\n".join(
+                f"• `conquestimages/{filename}`"
+                for filename in missing
+            )
+        )
+
+    return None
+
+
+def conquest_faction_color(
+    guild: discord.Guild,
+    faction: str,
+) -> tuple[int, int, int]:
+    role = discord.utils.get(
+        guild.roles,
+        name=faction,
+    )
+
+    fallback = CONQUEST_FALLBACK_COLORS.get(
+        faction,
+        (128, 128, 128),
+    )
+
+    if role is None:
+        return fallback
+
+    # Discord returns value 0 when no role color is configured. Free Blade is
+    # intentionally black, while the other factions use their fallback color
+    # if Discord says the role has no color.
+    if role.color.value == 0 and faction != "Free Blade":
+        return fallback
+
+    return role.color.to_rgb()
+
+
+def conquest_region_mask(
+    region_path: Path,
+    base_size: tuple[int, int],
+) -> Image.Image:
+    with Image.open(region_path) as opened:
+        region = opened.convert("RGBA")
+
+    if region.size != base_size:
+        base_ratio = base_size[0] / base_size[1]
+        region_ratio = region.size[0] / region.size[1]
+
+        if abs(base_ratio - region_ratio) > 0.03:
+            raise ValueError(
+                f"{region_path.name} has size {region.size[0]}x{region.size[1]}, "
+                f"which does not match the base map {base_size[0]}x{base_size[1]}."
+            )
+
+        resampling = (
+            Image.Resampling.LANCZOS
+            if hasattr(Image, "Resampling")
+            else Image.LANCZOS
+        )
+        region = region.resize(
+            base_size,
+            resampling,
+        )
+
+    alpha = region.getchannel("A")
+    alpha_min, alpha_max = alpha.getextrema()
+
+    # Best case: the region PNG has a true transparent background.
+    if alpha_min < 250 and alpha_max > 0:
+        return alpha.point(
+            lambda value: 255 if value >= 20 else 0
+        )
+
+    # Fallback for white-region-on-black-background PNGs. This keeps the
+    # system usable even if GitHub stripped or replaced transparency.
+    luminance = region.convert("L")
+    return luminance.point(
+        lambda value: 255 if value >= 32 else 0
+    )
+
+
+def conquest_detail_mask(
+    base: Image.Image,
+) -> Image.Image:
+    """Preserve the red borders and dark labels/details from the base map."""
+    rgb = base.convert("RGB")
+    mask = Image.new("L", base.size, 0)
+
+    src = rgb.load()
+    dst = mask.load()
+
+    for y in range(base.height):
+        for x in range(base.width):
+            r, g, b = src[x, y]
+
+            red_border = (
+                r >= 145
+                and r >= g + 45
+                and r >= b + 45
+            )
+
+            dark_detail = (
+                r <= 95
+                and g <= 95
+                and b <= 95
+            )
+
+            if red_border or dark_detail:
+                dst[x, y] = 255
+
+    return mask
+
+
+async def conquest_ownership(
+    guild_id: int,
+) -> dict[str, str | None]:
+    rows = await db().fetch(
+        """
+        SELECT territory_name, owner_faction
+        FROM conquest_regions_v2
+        WHERE guild_id=$1
+        """,
+        guild_id,
+    )
+
+    ownership = {
+        territory: None
+        for territory in CONQUEST_TERRITORIES
+    }
+
+    for row in rows:
+        territory = str(row["territory_name"])
+        if territory in ownership:
+            ownership[territory] = row["owner_faction"]
+
+    return ownership
+
+
+def conquest_embed(
+    ownership: dict[str, str | None],
+) -> discord.Embed:
+    lines = [
+        f"**{territory}:** {ownership.get(territory) or 'Unclaimed'}"
+        for territory in CONQUEST_TERRITORIES
+    ]
+
+    embed = discord.Embed(
+        title="🗺️ Astrelius Conquest Map",
+        description="\n".join(lines),
+        color=discord.Color.red(),
+    )
+
+    embed.set_image(
+        url="attachment://conquestmap.png"
+    )
+
+    return embed
+
+
+def render_conquest_map(
+    guild: discord.Guild,
+    ownership: dict[str, str | None],
+) -> io.BytesIO:
+    asset_error = conquest_assets_error()
+    if asset_error:
+        raise FileNotFoundError(asset_error)
+
+    base_path = conquest_base_map_path()
+    if base_path is None:
+        raise FileNotFoundError(
+            "The conquest base map could not be found."
+        )
+
+    with Image.open(base_path) as opened:
+        original_base = opened.convert("RGBA")
+
+    rendered = original_base.copy()
+    details = conquest_detail_mask(original_base)
+
+    for territory in CONQUEST_TERRITORIES:
+        faction = ownership.get(territory)
+
+        if not faction:
+            continue
+
+        region_path = (
+            CONQUEST_IMAGE_DIR
+            / CONQUEST_REGION_FILES[territory]
+        )
+
+        mask = conquest_region_mask(
+            region_path,
+            rendered.size,
+        )
+
+        color = conquest_faction_color(
+            guild,
+            faction,
+        )
+
+        solid = Image.new(
+            "RGBA",
+            rendered.size,
+            (*color, 255),
+        )
+
+        rendered.paste(
+            solid,
+            (0, 0),
+            mask,
+        )
+
+    # Put the original borders and labels back on top after tinting.
+    rendered.paste(
+        original_base,
+        (0, 0),
+        details,
+    )
+
+    output = io.BytesIO()
+    rendered.save(
+        output,
+        format="PNG",
+        optimize=True,
+    )
+    output.seek(0)
+    return output
+
+
+async def refresh_conquest_board(
+    guild: discord.Guild,
+) -> tuple[bool, str | None]:
+    board = await db().fetchrow(
+        """
+        SELECT channel_id, message_id
+        FROM conquest_board_v2
+        WHERE guild_id=$1
+        """,
+        guild.id,
+    )
+
+    if not board:
+        return False, "No conquest board is linked yet."
+
+    channel = guild.get_channel(
+        int(board["channel_id"])
+    )
+
+    if channel is None:
+        try:
+            channel = await bot.fetch_channel(
+                int(board["channel_id"])
+            )
+        except (
+            discord.NotFound,
+            discord.Forbidden,
+            discord.HTTPException,
+        ):
+            return False, "I could not find the linked conquest channel."
+
+    try:
+        message = await channel.fetch_message(
+            int(board["message_id"])
+        )
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException,
+    ):
+        return False, "I could not find the linked conquest message."
+
+    ownership = await conquest_ownership(
+        guild.id
+    )
+
+    try:
+        image_data = render_conquest_map(
+            guild,
+            ownership,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        return False, str(exc)
+
+    file = discord.File(
+        image_data,
+        filename="conquestmap.png",
+    )
+
+    try:
+        await message.edit(
+            embed=conquest_embed(ownership),
+            attachments=[file],
+        )
+    except (
+        discord.Forbidden,
+        discord.HTTPException,
+    ) as exc:
+        return False, f"I could not update the conquest board: {exc}"
+
+    return True, None
+
+
+@conquest_group.command(
+    name="post",
+    description="Post the public conquest map board",
+)
+@app_commands.check(staff_check)
+async def conquest_post(
+    interaction: discord.Interaction,
+):
+    if interaction.guild is None or interaction.channel is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    asset_error = conquest_assets_error()
+    if asset_error:
+        await interaction.followup.send(
+            asset_error,
+            ephemeral=True,
+        )
+        return
+
+    ownership = await conquest_ownership(
+        interaction.guild.id
+    )
+
+    try:
+        image_data = render_conquest_map(
+            interaction.guild,
+            ownership,
+        )
+    except (FileNotFoundError, ValueError) as exc:
+        await interaction.followup.send(
+            str(exc),
+            ephemeral=True,
+        )
+        return
+
+    file = discord.File(
+        image_data,
+        filename="conquestmap.png",
+    )
+
+    try:
+        message = await interaction.channel.send(
+            embed=conquest_embed(ownership),
+            file=file,
+        )
+    except (
+        discord.Forbidden,
+        discord.HTTPException,
+    ) as exc:
+        await interaction.followup.send(
+            f"I could not post the conquest map: {exc}",
+            ephemeral=True,
+        )
+        return
+
+    await db().execute(
+        """
+        INSERT INTO conquest_board_v2 (
+            guild_id,
+            channel_id,
+            message_id,
+            updated_at
+        )
+        VALUES ($1,$2,$3,now())
+        ON CONFLICT (guild_id)
+        DO UPDATE SET
+            channel_id=EXCLUDED.channel_id,
+            message_id=EXCLUDED.message_id,
+            updated_at=now()
+        """,
+        interaction.guild.id,
+        interaction.channel.id,
+        message.id,
+    )
+
+    await interaction.followup.send(
+        "Conquest map posted and linked to this channel.",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(
+    name="region",
+    description="Set who owns a conquest region",
+)
+@app_commands.check(staff_check)
+@app_commands.choices(
+    region=CONQUEST_REGION_CHOICES,
+    owner=CONQUEST_OWNER_CHOICES,
+)
+async def region_command(
+    interaction: discord.Interaction,
+    region: app_commands.Choice[str],
+    owner: app_commands.Choice[str],
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    owner_value = (
+        None
+        if owner.value == "Unclaimed"
+        else owner.value
+    )
+
+    if owner_value is not None:
+        role = discord.utils.get(
+            interaction.guild.roles,
+            name=owner_value,
+        )
+
+        if role is None:
+            await interaction.response.send_message(
+                (
+                    f"The faction role `{owner_value}` does not exist. "
+                    "Create that exact Discord role first."
+                ),
+                ephemeral=True,
+            )
+            return
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    await db().execute(
+        """
+        INSERT INTO conquest_regions_v2 (
+            guild_id,
+            territory_name,
+            owner_faction,
+            updated_at
+        )
+        VALUES ($1,$2,$3,now())
+        ON CONFLICT (guild_id, territory_name)
+        DO UPDATE SET
+            owner_faction=EXCLUDED.owner_faction,
+            updated_at=now()
+        """,
+        interaction.guild.id,
+        region.value,
+        owner_value,
+    )
+
+    refreshed, refresh_error = await refresh_conquest_board(
+        interaction.guild
+    )
+
+    message = (
+        f"**{region.value}** is now owned by "
+        f"**{owner_value or 'Unclaimed'}**."
+    )
+
+    if not refreshed:
+        message += (
+            "\nThe ownership was saved, but the map was not refreshed. "
+            + (refresh_error or "Run `/conquest post` first.")
+        )
+
+    await interaction.followup.send(
+        message,
+        ephemeral=True,
+    )
+
+
+@conquest_group.command(
+    name="reset",
+    description="Reset every conquest region to unclaimed",
+)
+@app_commands.check(staff_check)
+async def conquest_reset(
+    interaction: discord.Interaction,
+):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "Use this command inside the server.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(
+        ephemeral=True,
+        thinking=True,
+    )
+
+    await db().execute(
+        """
+        DELETE FROM conquest_regions_v2
+        WHERE guild_id=$1
+        """,
+        interaction.guild.id,
+    )
+
+    refreshed, refresh_error = await refresh_conquest_board(
+        interaction.guild
+    )
+
+    message = (
+        "🗺️ Conquest reset complete. All seven regions are now **Unclaimed**."
+    )
+
+    if not refreshed:
+        message += (
+            "\nThe ownership reset was saved, but the map was not refreshed. "
+            + (refresh_error or "Run `/conquest post` first.")
+        )
+
+    await interaction.followup.send(
+        message,
+        ephemeral=True,
+    )
+
+
+# =========================================================
 # REGISTER GROUPS
 # =========================================================
 
@@ -7302,6 +7943,7 @@ for group in (
     gold_group,
     materials_group,
     faction_points_group,
+    conquest_group,
 ):
     bot.tree.add_command(
         group
